@@ -1,0 +1,138 @@
+name: Build & Release
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main ]
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          check-latest: true
+
+      - name: Install golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: latest
+
+      - name: Lint
+        run: make lint
+
+      - name: Test
+        run: make test
+
+  release-build:
+    name: Build (${{ matrix.os }}/${{ matrix.arch }})
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [ test ]
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - os: linux
+            arch: amd64
+          - os: linux
+            arch: arm64
+          - os: darwin
+            arch: amd64
+          - os: darwin
+            arch: arm64
+          - os: windows
+            arch: amd64
+      fail-fast: false
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          check-latest: true
+
+      - name: Build binary
+        env:
+          GOOS: ${{ matrix.os }}
+          GOARCH: ${{ matrix.arch }}
+        run: |
+          BINARY="onley_${{ matrix.os }}_${{ matrix.arch }}"
+          if [ "${{ matrix.os }}" = "windows" ]; then
+            BINARY="${BINARY}.exe"
+          fi
+          go build -trimpath -ldflags="-s -w" -o "$BINARY" ./cmd/onley
+          echo "binary=$BINARY" >> $GITHUB_ENV
+
+      - name: Package archive
+        run: |
+          BINARY="${{ env.binary }}"
+          TAG="${{ github.ref_name }}"
+          if [ "${{ matrix.os }}" = "windows" ]; then
+            ARCHIVE="onley_${TAG}_${{ matrix.os }}_${{ matrix.arch }}.zip"
+            7z a "$ARCHIVE" "$BINARY"
+          else
+            ARCHIVE="onley_${TAG}_${{ matrix.os }}_${{ matrix.arch }}.tar.gz"
+            tar czf "$ARCHIVE" "$BINARY"
+          fi
+          echo "archive=$ARCHIVE" >> $GITHUB_ENV
+          sha256sum "$ARCHIVE" >> /tmp/checksums-all.txt
+
+      - name: Upload archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.archive }}
+          path: ${{ env.archive }}
+
+      - name: Upload checksums (intermediate)
+        uses: actions/upload-artifact@v4
+        with:
+          name: checksums-${{ matrix.os }}-${{ matrix.arch }}
+          path: /tmp/checksums-all.txt
+
+  release-publish:
+    name: Publish Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [ release-build ]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/artifacts
+          merge-multiple: false
+
+      - name: Collect archives and checksums
+        run: |
+          # Gather checksums from all matrix jobs
+          find /tmp/artifacts -name 'checksums-all.txt' -exec cat {} \; | sort -u > checksums.txt
+
+          # Gather archives (skip checksum dirs)
+          mkdir -p archives
+          for d in /tmp/artifacts/*/; do
+            base=$(basename "$d")
+            case "$base" in checksums-*) continue;; esac
+            cp "$d"/* ./archives/ 2>/dev/null || true
+          done
+          ls -la archives/
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            archives/*
+            checksums.txt
+          generate_release_notes: true
+          draft: false
+          prerelease: false
