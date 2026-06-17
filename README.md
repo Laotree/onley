@@ -1,5 +1,9 @@
 # onley
 
+<p align="center">
+  <img src="logo.png" alt="onley logo" width="200">
+</p>
+
 A local file deduplication tool. Indexes files by MD5, finds duplicates, and lets you clean them up interactively — on a single machine or across multiple machines.
 
 ## Features

@@ -1,5 +1,9 @@
 # onley
 
+<p align="center">
+  <img src="logo.png" alt="onley logo" width="200">
+</p>
+
 本地文件去重工具。通过 MD5 建立文件索引，找出重复文件，支持交互式清理——可在单台机器上使用，也可跨多台机器协同工作。
 
 ## 功能特性
