@@ -1,24 +1,12 @@
 version: "2"
 
 linters:
-  enable:
+  disable:
     - errcheck
-    - gosimple
+  enable:
     - govet
     - staticcheck
     - unused
-
-issues:
-  exclude:
-    - "Error return value of `fmt\\.Fprint(ln)?` is not checked"
-    - "Error return value of `(os\\.Remove|os\\.RemoveAll|os\\.Chmod|os\\.WriteFile)` is not checked"
-    - "Error return value of `.*\\.Close` is not checked"
-    - "Error return value of `store\\.DeleteRecord` is not checked"
-    - "Error return value of `conn\\.(Close|Exec)` is not checked"
-    - "Error return value of `rows\\.(Close|Next)` is not checked"
-    - "Error return value of `.*\\.Run` is not checked"
-    - "Error return value of `.*\\.Upsert` is not checked"
-    - "Error return value of `_.*` is not checked"
 
 run:
   timeout: 5m
