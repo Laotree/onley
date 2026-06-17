@@ -1,3 +1,5 @@
+version: "2"
+
 linters:
   enable:
     - errcheck
@@ -7,8 +9,6 @@ linters:
     - unused
 
 issues:
-  # Exclude errcheck for deferred cleanup, test helpers, and cases where
-  # errors are intentionally ignored (e.g., fmt.Fprintln to stderr).
   exclude:
     - "Error return value of `fmt\\.Fprint(ln)?` is not checked"
     - "Error return value of `(os\\.Remove|os\\.RemoveAll|os\\.Chmod|os\\.WriteFile)` is not checked"
