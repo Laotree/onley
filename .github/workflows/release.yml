@@ -15,15 +15,15 @@ jobs:
     name: Test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version: '1.26'
           check-latest: true
 
       - name: Install golangci-lint
-        uses: golangci/golangci-lint-action@v6
+        uses: golangci/golangci-lint-action@v9
         with:
           version: latest
 
@@ -54,9 +54,9 @@ jobs:
       fail-fast: false
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version: '1.26'
           check-latest: true
@@ -88,13 +88,13 @@ jobs:
           sha256sum "$ARCHIVE" >> /tmp/checksums-all.txt
 
       - name: Upload archive
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ env.archive }}
           path: ${{ env.archive }}
 
       - name: Upload checksums (intermediate)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: checksums-${{ matrix.os }}-${{ matrix.arch }}
           path: /tmp/checksums-all.txt
@@ -105,10 +105,10 @@ jobs:
     needs: [ release-build ]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: /tmp/artifacts
           merge-multiple: false
@@ -128,7 +128,7 @@ jobs:
           ls -la archives/
 
       - name: Publish release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: |
             archives/*
