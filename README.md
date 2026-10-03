@@ -18,14 +18,28 @@ A local file deduplication tool. Indexes files by MD5, finds duplicates, and let
 
 ## Install
 
+Download a release archive for your platform:
+
 ```sh
-go install onley/cmd/onley@latest
+# macOS (Apple silicon)
+tar xzf onley_<version>_darwin_arm64.tar.gz
+
+# Linux (x86-64)
+tar xzf onley_<version>_linux_amd64.tar.gz
 ```
 
-Or build from source:
+Archives are published for darwin and linux on amd64 and arm64, plus windows on
+amd64, each with a `checksums.txt` alongside. See
+[releases](https://github.com/Laotree/onley/releases).
+
+`go install` does not work and is not offered: the module path is `onley`, which
+is not a resolvable repository location. Fixing that means changing the import
+path of every package, so it has not been done.
+
+To build from source:
 
 ```sh
-git clone <repo>
+git clone https://github.com/Laotree/onley
 cd onley
 make build      # produces ./onley
 ```
@@ -251,6 +265,10 @@ The master exposes a small JSON API used internally by `replica check`. It can a
 | `GET` | `/v1/check?md5=<hash>` | Returns `{"found":bool,"paths":[...]}` |
 | `POST` | `/v1/ingest` | Multipart upload: fields `file`, `md5` |
 
+`onley` sends this request with chunked transfer encoding: the file is streamed
+rather than measured and buffered first, so `Content-Length` is absent. A direct
+client should not depend on `Content-Length` being present.
+
 ## Development
 
 ```sh
@@ -260,4 +278,4 @@ make lint       # golangci-lint
 make clean      # remove binary and coverage files
 ```
 
-Requirements: Go 1.22+
+Requirements: Go 1.26.4 or newer (the version the module declares)
