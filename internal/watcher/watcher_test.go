@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -103,15 +104,115 @@ func TestIndexesFileAfterItStopsChanging(t *testing.T) {
 	})
 }
 
-// TestWritesFasterThanDebounceAreNotIndexed covers the guarantee the debounce
-// window can actually make: a burst of writes that never leaves the file quiet
-// for the whole window produces no event, so no half-written file is indexed.
+// TestCheckStable_ReholdsWhenSizeChanged is the guard that keeps a half-written
+// file out of the index, tested without any timing.
 //
-// A pause longer than the window is a different case and cannot be covered
-// here: a writer that stops for longer than the debounce is indistinguishable
-// from one that finished, and the file is then indexed. Raise -debounce to
-// cover writes that stall.
-func TestWritesFasterThanDebounceAreNotIndexed(t *testing.T) {
+// The window opened at one size and the file grew before it closed, so the
+// path must go back to waiting instead of being reported. Driving checkStable
+// directly is what makes this deterministic: an integration test can only
+// assert it by keeping a writer's pauses shorter than the debounce, which is a
+// promise about the machine's scheduling that the test cannot keep.
+func TestCheckStable_ReholdsWhenSizeChanged(t *testing.T) {
+	root := t.TempDir()
+	w, err := New(root, testDebounce)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer w.Close()
+	r := record(w)
+
+	path := filepath.Join(root, "growing.bin")
+	write(t, path, "small")
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The window opens on the size the file has now, then the file grows.
+	w.hold(path, info.Size(), info.ModTime().Unix())
+	write(t, path, "small but larger now")
+
+	w.checkStable(path)
+
+	// It must be waiting again rather than dropped.
+	w.mu.Lock()
+	_, waiting := w.pending[path]
+	w.mu.Unlock()
+	if !waiting {
+		t.Fatalf("the path was dropped instead of being put back to wait")
+	}
+
+	// Now that the size has stopped changing, the reopened window reports it.
+	// Asserting this rather than only the absence of an event keeps the test
+	// from passing merely because the recorder goroutine had not run yet.
+	w.checkStable(path)
+	waitFor(t, "the file to be reported once it stopped changing", func() bool {
+		return hasEvent(r.seen(), path, indexed)
+	})
+}
+
+// TestCheckStable_ReportsWhenUnchanged is the other half: once the size and mtime
+// stop changing, the file is reported.
+func TestCheckStable_ReportsWhenUnchanged(t *testing.T) {
+	root := t.TempDir()
+	w, err := New(root, testDebounce)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer w.Close()
+	r := record(w)
+
+	path := filepath.Join(root, "still.bin")
+	write(t, path, "done")
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	w.hold(path, info.Size(), info.ModTime().Unix())
+	w.checkStable(path)
+
+	waitFor(t, "a file that stopped changing to be reported", func() bool {
+		return hasEvent(r.seen(), path, indexed)
+	})
+}
+
+// TestCheckStable_GoneFileIsReportedRemoved covers the unlink that arrives
+// without its own event, which is what happens when the last descriptor closes
+// after the file is removed.
+func TestCheckStable_GoneFileIsReportedRemoved(t *testing.T) {
+	root := t.TempDir()
+	w, err := New(root, testDebounce)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer w.Close()
+	r := record(w)
+
+	path := filepath.Join(root, "vanishing.bin")
+	write(t, path, "here")
+	w.hold(path, int64(4), 1)
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+
+	w.checkStable(path)
+
+	waitFor(t, "the vanished file to be reported as gone", func() bool {
+		return hasEvent(r.seen(), path, removed)
+	})
+}
+
+// TestBurstWriteIsFollowedByLaterWrites covers a burst of writes end to end
+// without asserting anything about how many events it produces.
+//
+// Intermediate reports are legitimate: a gap longer than the debounce window is
+// indistinguishable from a finished write, so how often the file is reported
+// during a burst depends on the machine's scheduling. What must hold is that
+// the file is reported once it settles, and that the watcher is still tracking it
+// afterwards, which is what makes an early report self-correcting rather than
+// final.
+func TestBurstWriteIsFollowedByLaterWrites(t *testing.T) {
 	root := t.TempDir()
 	w, err := New(root, testDebounce)
 	if err != nil {
@@ -126,23 +227,32 @@ func TestWritesFasterThanDebounceAreNotIndexed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
-	// Each write is followed by a gap shorter than the window, so the window
-	// never closes while the file is still growing.
 	for i := 0; i < 12; i++ {
 		f.Write(make([]byte, 4096))
 		f.Sync()
 		time.Sleep(testDebounce / 4)
 	}
-
-	for _, ev := range r.seen() {
-		if ev.Path == path && indexed(ev) {
-			t.Fatalf("indexed a file whose writes never paused for the debounce window")
-		}
-	}
 	f.Close()
 
-	waitFor(t, "the finished file to be indexed", func() bool {
+	waitFor(t, "the burst to settle and be reported", func() bool {
 		return hasEvent(r.seen(), path, indexed)
+	})
+
+	// A later change must still be picked up, which is what corrects the index
+	// if the burst was reported early.
+	seenBefore := len(r.seen())
+	write(t, path, strings.Repeat("z", 8))
+	waitFor(t, "a report after the later write", func() bool {
+		events := r.seen()
+		if len(events) <= seenBefore {
+			return false
+		}
+		for _, ev := range events[seenBefore:] {
+			if ev.Path == path && indexed(ev) {
+				return true
+			}
+		}
+		return false
 	})
 }
 
