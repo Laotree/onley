@@ -10,6 +10,12 @@ import (
 	"onley/internal/db"
 )
 
+// maxIngestMemory is how much of an upload is held in memory before the rest
+// goes to a temporary file. It used to be 512 MB, which is a large amount of RAM
+// to spend on a single request. onley exists to move large files around, so the
+// ordinary case now lands on disk.
+const maxIngestMemory = 32 << 20
+
 // Server implements the master HTTP API for the replica feature.
 type Server struct {
 	store    *db.DB
@@ -74,7 +80,9 @@ func (s *Server) handleCheck(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
-	if err := r.ParseMultipartForm(512 << 20); err != nil {
+	// The file part arrives as a readable stream either way; maxIngestMemory only
+	// decides whether it is backed by memory or by a temporary file.
+	if err := r.ParseMultipartForm(maxIngestMemory); err != nil {
 		http.Error(w, "parse form: "+err.Error(), http.StatusBadRequest)
 		return
 	}
