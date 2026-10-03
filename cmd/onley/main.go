@@ -22,7 +22,15 @@ import (
 	"onley/internal/watcher"
 )
 
-const defaultDBFile = "onley.db"
+const (
+	// dbDirName and dbFileName make up the default index location under the
+	// home directory.
+	dbDirName  = ".onley"
+	dbFileName = "local.db"
+	// legacyDBFile is the working-directory-relative name the index used to
+	// default to.
+	legacyDBFile = "onley.db"
+)
 
 func main() {
 	os.Exit(run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr))
@@ -31,7 +39,9 @@ func main() {
 func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("onley", flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	dbPath := fs.String("db", defaultDBFile, "SQLite database path")
+	// The default stays empty so an explicit -db is distinguishable from an
+	// omitted one, and so PrintDefaults does not print a stale path.
+	dbPath := fs.String("db", "", "SQLite database path (default: ~/"+dbDirName+"/"+dbFileName+")")
 	workers := fs.Int("workers", max(1, runtime.NumCPU()-1), "number of concurrent workers")
 	fs.Usage = func() {
 		fmt.Fprintf(stderr, "Usage: onley [options] <subcommand> [args]\n\n")
@@ -56,6 +66,17 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	if len(rest) == 0 {
 		fs.Usage()
 		return 1
+	}
+
+	// Resolved after the subcommand is known, so printing usage or rejecting a
+	// bad flag does not create a home directory as a side effect.
+	if *dbPath == "" {
+		resolved, err := defaultDBPath(stderr)
+		if err != nil {
+			fmt.Fprintf(stderr, "error: %v\n", err)
+			return 1
+		}
+		*dbPath = resolved
 	}
 
 	switch rest[0] {
@@ -107,6 +128,80 @@ func openDB(path string, stderr io.Writer) *db.DB {
 		return nil
 	}
 	return store
+}
+
+// defaultDBPath returns the index location used when -db is not given, and
+// creates its directory.
+//
+// The index used to default to "onley.db" in the working directory, which meant
+// every directory had its own index: a scan in one place left `onley stats` in
+// another reporting an empty tree. The home directory gives one index per user
+// instead.
+//
+// Failing to locate the home directory is reported rather than worked around.
+// Falling back to a working-directory path would reintroduce exactly the
+// behaviour this replaces.
+func defaultDBPath(stderr io.Writer) (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("cannot locate the home directory, pass -db to choose an index: %w", err)
+	}
+	dir := filepath.Join(home, dbDirName)
+	// 0700 because the index lists the paths and digests of the user's files.
+	// The directory is what keeps it private; the file mode inside it does not
+	// have to be restrictive as well.
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", fmt.Errorf("cannot create %s: %w", dir, err)
+	}
+	target := filepath.Join(dir, dbFileName)
+	adoptLegacyDB(target, stderr)
+	return target, nil
+}
+
+// adoptLegacyDB copies a working-directory onley.db to the new default location
+// the first time onley runs without -db. It runs once, because the default
+// index existing is what marks the migration as done.
+//
+// The old file is left in place: a user who wants it can keep passing
+// -db ./onley.db, and a copy is recoverable if the new location turns out to be
+// wrong.
+func adoptLegacyDB(target string, stderr io.Writer) {
+	if _, err := os.Stat(target); err == nil {
+		return
+	}
+	if _, err := os.Stat(legacyDBFile); err != nil {
+		return
+	}
+	if err := copyFile(legacyDBFile, target); err != nil {
+		fmt.Fprintf(stderr, "warning: could not copy %s to %s: %v\n", legacyDBFile, target, err)
+		return
+	}
+	fmt.Fprintf(stderr, "Copied %s to %s. Pass -db %s to keep using the old index.\n",
+		legacyDBFile, target, legacyDBFile)
+}
+
+// copyFile copies src to dst without loading either into memory, because an
+// index can outgrow a buffer. It refuses to overwrite, so a concurrent onley
+// that created dst first keeps its index.
+func copyFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+
+	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		if os.IsExist(err) {
+			return nil // another process got there first
+		}
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		out.Close()
+		return err
+	}
+	return out.Close()
 }
 
 func cmdScan(dbPath, dir string, workers int, stdout, stderr io.Writer) int {

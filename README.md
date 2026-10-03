@@ -69,8 +69,20 @@ onley watch ~/Downloads
 
 | Flag | Default | Description |
 |---|---|---|
-| `-db <path>` | `onley.db` | SQLite database file |
+| `-db <path>` | `~/.onley/local.db` | SQLite database file |
 | `-workers <n>` | `max(1, CPUs-1)` | Concurrent hash workers |
+
+The default index lives in the home directory so that every directory sees the
+same one: `onley scan ~/Downloads` followed by `onley stats` from somewhere else
+reports what was scanned. The directory is created if missing.
+
+If an `onley.db` sits in the working directory and the default index does not
+exist yet, it is copied there once and onley says so. The old file is left where
+it is; pass `-db ./onley.db` to keep using it.
+
+An explicit `-db` path is used exactly as given, and a relative one is relative
+to the working directory. onley does not create missing parent directories for
+it, so a typo in the path is reported rather than quietly making one.
 
 ## Scan
 

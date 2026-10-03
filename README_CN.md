@@ -69,8 +69,18 @@ onley watch ~/Downloads
 
 | 参数 | 默认值 | 说明 |
 |---|---|---|
-| `-db <path>` | `onley.db` | SQLite 数据库文件路径 |
+| `-db <path>` | `~/.onley/local.db` | SQLite 数据库文件路径 |
 | `-workers <n>` | `max(1, CPU数-1)` | 并发 hash worker 数量 |
+
+默认索引放在 home 目录下，这样任何目录看到的是同一份索引：在 `~/Downloads`
+里 `onley scan`，换个目录再 `onley stats`，仍然能看到扫描结果。该目录不存在
+时会自动创建。
+
+如果当前目录下有 `onley.db`、而默认索引还不存在，onley 会把它复制过去并给出
+提示。旧文件保留在原地，用 `-db ./onley.db` 仍可继续使用。
+
+显式指定的 `-db` 路径按原样使用，相对路径相对于当前目录。onley 不会为它创建
+缺失的父目录，因此路径写错时会直接报错，而不是悄悄建出一个目录。
 
 ## 扫描
 

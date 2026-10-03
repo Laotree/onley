@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -498,6 +499,27 @@ func TestMain(m *testing.M) {
 	}
 	defer os.RemoveAll(tmp)
 
+	// The index defaults to a path under the home directory, so tests would
+	// otherwise create it in the home of whoever runs them, and adopt an
+	// onley.db that happens to sit in the package directory.
+	//
+	// The Go caches are pinned first: GOMODCACHE and GOCACHE are derived from
+	// the home directory, so moving HOME would send the build below to a fresh
+	// empty cache and make TestMain download the world.
+	for _, name := range []string{"GOMODCACHE", "GOCACHE", "GOPATH"} {
+		if v := os.Getenv(name); v != "" {
+			os.Setenv(name, v)
+		} else if v, err := exec.Command("go", "env", name).Output(); err == nil {
+			os.Setenv(name, strings.TrimSpace(string(v)))
+		}
+	}
+	home := filepath.Join(tmp, "home")
+	os.Setenv("HOME", home)
+	os.Setenv("USERPROFILE", home)
+	if err := os.MkdirAll(home, 0o700); err != nil {
+		panic(err)
+	}
+
 	bin := filepath.Join(tmp, "onley")
 	out, err := exec.Command("go", "build", "-o", bin, "onley/cmd/onley").CombinedOutput()
 	if err != nil {
@@ -952,5 +974,273 @@ func TestBinary_SmokeStats(t *testing.T) {
 	}
 	if !strings.Contains(string(out), "1") {
 		t.Errorf("stats should show 1 file; got: %s", out)
+	}
+}
+
+// --- default index location ---
+
+// fakeHome points the home directory at a fresh temporary directory for one
+// test and returns it.
+func fakeHome(t *testing.T) string {
+	t.Helper()
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	return home
+}
+
+// TestDefaultDBPath_LivesUnderHome covers the reason the default moved: an
+// index named after the working directory gave every directory its own, so a
+// scan in one place left stats in another reporting nothing.
+func TestDefaultDBPath_LivesUnderHome(t *testing.T) {
+	home := fakeHome(t)
+	work := t.TempDir()
+	t.Chdir(work)
+
+	if _, _, code := runCmd("stats"); code != 0 {
+		t.Fatalf("stats without -db failed: %d", code)
+	}
+
+	if _, err := os.Stat(filepath.Join(home, ".onley", "local.db")); err != nil {
+		t.Errorf("index not created under the home directory: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(work, legacyDBFile)); err == nil {
+		t.Errorf("an index was created in the working directory")
+	}
+}
+
+// TestDefaultDBPath_SameIndexFromAnyDirectory is the property that matters:
+// two directories must see one index.
+func TestDefaultDBPath_SameIndexFromAnyDirectory(t *testing.T) {
+	fakeHome(t)
+	scanDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(scanDir, "f.txt"), []byte("hi"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Chdir(scanDir)
+	if _, _, code := runCmd("scan", scanDir); code != 0 {
+		t.Fatalf("scan failed: %d", code)
+	}
+
+	t.Chdir(t.TempDir())
+	stdout, _, code := runCmd("stats")
+	if code != 0 {
+		t.Fatalf("stats failed: %d", code)
+	}
+	if !strings.Contains(stdout, "Total indexed: 1") {
+		t.Errorf("a scan in another directory was not visible: %s", stdout)
+	}
+}
+
+// TestDefaultDBPath_DirectoryIsPrivate checks the mode of the directory that
+// holds the inventory of the user's files.
+func TestDefaultDBPath_DirectoryIsPrivate(t *testing.T) {
+	fakeHome(t)
+	t.Chdir(t.TempDir())
+
+	if _, _, code := runCmd("stats"); code != 0 {
+		t.Fatalf("stats failed: %d", code)
+	}
+
+	info, err := os.Stat(filepath.Join(os.Getenv("HOME"), dbDirName))
+	if err != nil {
+		t.Fatalf("stat %s: %v", dbDirName, err)
+	}
+	if runtime.GOOS != "windows" {
+		if perm := info.Mode().Perm(); perm != 0o700 {
+			t.Errorf("%s mode = %o, want 700", dbDirName, perm)
+		}
+	}
+}
+
+// TestDefaultDBPath_AdoptsWorkingDirectoryIndex covers the migration: a user who
+// already has onley.db keeps their index.
+func TestDefaultDBPath_AdoptsWorkingDirectoryIndex(t *testing.T) {
+	home := fakeHome(t)
+	work := t.TempDir()
+	t.Chdir(work)
+
+	seed, err := db.Open(filepath.Join(work, legacyDBFile))
+	if err != nil {
+		t.Fatalf("seed db.Open: %v", err)
+	}
+	if err := seed.Upsert(db.FileRecord{
+		Path: "/kept.txt", Name: "kept.txt", Size: 4, MD5: "d41d8cd98f00b204e9800998ecf8427e",
+	}); err != nil {
+		t.Fatalf("seed Upsert: %v", err)
+	}
+	seed.Close()
+
+	stdout, stderr, code := runCmd("stats")
+	if code != 0 {
+		t.Fatalf("stats failed: %d", code)
+	}
+	if !strings.Contains(stdout, "Total indexed: 1") {
+		t.Errorf("adopted index lost its contents: %s", stdout)
+	}
+	if !strings.Contains(stderr, legacyDBFile) {
+		t.Errorf("the copy was not reported: %s", stderr)
+	}
+
+	// The old file stays, so -db ./onley.db keeps working.
+	if _, err := os.Stat(filepath.Join(work, legacyDBFile)); err != nil {
+		t.Errorf("the old index was removed: %v", err)
+	}
+	adopted, err := db.Open(filepath.Join(home, dbDirName, dbFileName))
+	if err != nil {
+		t.Fatalf("open adopted index: %v", err)
+	}
+	defer adopted.Close()
+	if rec, err := adopted.Lookup("/kept.txt"); err != nil || rec == nil {
+		t.Errorf("the record did not survive the copy: rec=%v err=%v", rec, err)
+	}
+}
+
+// TestDefaultDBPath_DoesNotOverwriteExistingIndex keeps a later run from
+// replacing a populated default index with whatever onley.db happens to sit in
+// the directory.
+func TestDefaultDBPath_DoesNotOverwriteExistingIndex(t *testing.T) {
+	home := fakeHome(t)
+	work := t.TempDir()
+	t.Chdir(work)
+
+	target := filepath.Join(home, dbDirName, dbFileName)
+	if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	existing, err := db.Open(target)
+	if err != nil {
+		t.Fatalf("seed default index: %v", err)
+	}
+	// Two records, so the count tells the two indexes apart.
+	for _, p := range []string{"/default.txt", "/second.txt"} {
+		if err := existing.Upsert(db.FileRecord{
+			Path: p, Name: filepath.Base(p), Size: 7, MD5: "abc",
+		}); err != nil {
+			t.Fatalf("seed Upsert: %v", err)
+		}
+	}
+	existing.Close()
+
+	// A stale onley.db in the working directory must be left alone.
+	stale, err := db.Open(filepath.Join(work, legacyDBFile))
+	if err != nil {
+		t.Fatalf("seed legacy index: %v", err)
+	}
+	if err := stale.Upsert(db.FileRecord{
+		Path: "/stale.txt", Name: "stale.txt", Size: 5, MD5: "def",
+	}); err != nil {
+		t.Fatalf("seed Upsert: %v", err)
+	}
+	stale.Close()
+
+	stdout, stderr, code := runCmd("stats")
+	if code != 0 {
+		t.Fatalf("stats failed: %d", code)
+	}
+	// Which index stats reads is what decides this: the default one, not the
+	// stale working-directory one.
+	if !strings.Contains(stdout, "Total indexed: 2") {
+		t.Errorf("stats did not report the default index: %s", stdout)
+	}
+	if strings.Contains(stderr, "Copied") {
+		t.Errorf("an existing default index was overwritten: %s", stderr)
+	}
+
+	kept, err := db.Open(target)
+	if err != nil {
+		t.Fatalf("reopen default index: %v", err)
+	}
+	defer kept.Close()
+	if rec, err := kept.Lookup("/default.txt"); err != nil || rec == nil {
+		t.Errorf("the default index lost its record: rec=%v err=%v", rec, err)
+	}
+	if rec, err := kept.Lookup("/stale.txt"); err != nil || rec != nil {
+		t.Errorf("the stale working-directory index was copied over it: rec=%v err=%v", rec, err)
+	}
+}
+
+// TestDefaultDBPath_ExplicitPathIsUsedVerbatim keeps -db an explicit choice: a
+// relative path stays relative to the working directory and nothing is created
+// under the home directory.
+func TestDefaultDBPath_ExplicitPathIsUsedVerbatim(t *testing.T) {
+	home := fakeHome(t)
+	work := t.TempDir()
+	t.Chdir(work)
+
+	if _, _, code := runCmd("-db", "chosen.db", "stats"); code != 0 {
+		t.Fatalf("stats failed: %d", code)
+	}
+
+	if _, err := os.Stat(filepath.Join(work, "chosen.db")); err != nil {
+		t.Errorf("-db chosen.db did not create the file in the working directory: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(home, dbDirName)); err == nil {
+		t.Errorf("an explicit -db still created the default directory")
+	}
+}
+
+// TestDefaultDBPath_MissingDirectoryForExplicitPathIsAnError keeps -db from
+// silently creating directories the user did not ask for.
+func TestDefaultDBPath_MissingDirectoryForExplicitPathIsAnError(t *testing.T) {
+	fakeHome(t)
+	work := t.TempDir()
+	t.Chdir(work)
+
+	missing := filepath.Join(work, "no-such-dir", "x.db")
+	if _, _, code := runCmd("-db", missing, "stats"); code == 0 {
+		t.Error("stats succeeded with a -db whose parent directory does not exist")
+	}
+	if _, err := os.Stat(filepath.Join(work, "no-such-dir")); err == nil {
+		t.Error("the missing parent directory was created anyway")
+	}
+}
+
+// TestDefaultDBPath_NoHomeDirectoryIsAnError covers the case that must not fall
+// back to a working-directory index, which is the behaviour being replaced.
+func TestDefaultDBPath_NoHomeDirectoryIsAnError(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the home directory comes from a different variable on Windows")
+	}
+	t.Setenv("HOME", "")
+	t.Chdir(t.TempDir())
+
+	_, stderr, code := runCmd("stats")
+	if code == 0 {
+		t.Error("stats succeeded without a home directory")
+	}
+	if !strings.Contains(stderr, "home directory") {
+		t.Errorf("stderr should explain the missing home directory: %s", stderr)
+	}
+}
+
+// TestDefaultDBPath_UsageNamesTheDefault keeps the new location discoverable,
+// because PrintDefaults prints nothing when the flag default is empty.
+func TestDefaultDBPath_UsageNamesTheDefault(t *testing.T) {
+	fakeHome(t)
+	t.Chdir(t.TempDir())
+
+	_, stderr, code := runCmd()
+	if code == 0 {
+		t.Fatal("no arguments should fail")
+	}
+	if !strings.Contains(stderr, "~/.onley/local.db") {
+		t.Errorf("usage should name the default index; got: %s", stderr)
+	}
+}
+
+// TestDefaultDBPath_NoArgumentsCreatesNothing guards the ordering: printing
+// usage must not create the directory as a side effect.
+func TestDefaultDBPath_NoArgumentsCreatesNothing(t *testing.T) {
+	home := fakeHome(t)
+	t.Chdir(t.TempDir())
+
+	if _, _, code := runCmd(); code == 0 {
+		t.Fatal("no arguments should fail")
+	}
+
+	if _, err := os.Stat(filepath.Join(home, dbDirName)); err == nil {
+		t.Error("printing usage created the default directory")
 	}
 }
