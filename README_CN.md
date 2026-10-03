@@ -18,14 +18,26 @@
 
 ## 安装
 
+按平台下载 release 归档：
+
 ```sh
-go install onley/cmd/onley@latest
+# macOS（Apple silicon）
+tar xzf onley_<版本号>_darwin_arm64.tar.gz
+
+# Linux（x86-64）
+tar xzf onley_<版本号>_linux_amd64.tar.gz
 ```
 
-或从源码构建：
+发布范围为 darwin 与 linux 的 amd64 / arm64，以及 windows 的 amd64，
+每个归档旁边都有 `checksums.txt`。见 [releases](https://github.com/Laotree/onley/releases)。
+
+`go install` 不可用，也没有提供：module 路径是 `onley`，不是一个可解析的仓库位置。
+要修就得改每个包的 import 路径，因此没有做。
+
+从源码构建：
 
 ```sh
-git clone <repo>
+git clone https://github.com/Laotree/onley
 cd onley
 make build      # 生成 ./onley
 ```
@@ -244,6 +256,10 @@ master 对外暴露一组小型 JSON API，供 `replica check` 内部调用，�
 | `GET` | `/v1/check?md5=<hash>` | 返回 `{"found":bool,"paths":[...]}` |
 | `POST` | `/v1/ingest` | Multipart 上传，字段：`file`、`md5` |
 
+`onley` 发送这个请求时使用 chunked 传输编码：文件是流式送出而不是先测长再缓冲，
+因此请求里没有 `Content-Length`。直接调用这个 API 的客户端不应当假定
+`Content-Length` 一定存在。
+
 ## 开发
 
 ```sh
@@ -253,4 +269,4 @@ make lint       # golangci-lint
 make clean      # 删除二进制文件和覆盖率文件
 ```
 
-运行环境要求：Go 1.22+
+运行环境要求：Go 1.26.4 或更高（module 声明的版本）
