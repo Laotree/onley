@@ -72,6 +72,15 @@ onley watch ~/Downloads
 |---|---|---|
 | `-db <path>` | `~/.onley/local.db` | SQLite database file |
 | `-workers <n>` | `max(1, CPUs-1)` | Concurrent hash workers |
+| `-y`, `--yes` | off | Assume yes for confirmations |
+
+Options go before the subcommand: `onley -y clean-all`, not `onley clean-all -y`.
+
+`-y` is permission to carry out a plan, not permission to destroy. In replica
+mode it authorises deleting a local copy only when this run has already uploaded
+that content to the master. Files the master already had are left alone with a
+warning, and the run exits non-zero because there is work waiting for a person.
+See [Replica mode](#replica-mode).
 
 The default index lives in the home directory so that every directory sees the
 same one: `onley scan ~/Downloads` followed by `onley stats` from somewhere else
@@ -126,13 +135,17 @@ Other commands can run against the same index while `watch` is running. Stop it 
 Keep number(s) (e.g. 1 or 1,2; Enter to skip): 1
 ```
 
-`clean-all` keeps the alphabetically first path in each group and deletes the rest after a single confirmation. It is not unattended: it asks once, and running it from a cron job with nothing on stdin fails rather than quietly keeping every file. Feed it an answer to script it:
+`clean-all` keeps the alphabetically first path in each group and deletes the rest after a single confirmation.
+
+`-y` skips that confirmation, which is what makes `clean-all` runnable from cron with nothing on stdin:
 
 ```sh
-echo y | onley clean-all
+onley -y clean-all
 ```
 
-`clean` and `clean-all` treat an exhausted stdin differently from a declined one. An empty stream has not declined anything, so the run fails and deletes nothing; answering `n` is a decision, and succeeds.
+`-y` does not stand in for the per-group question in `clean`. Deciding which copy to keep is what that command is for, and answering it on your behalf would pick a different deletion target than the one you wanted. So `onley -y clean` still reads stdin for the choices and only skips the final yes/no.
+
+Without `-y`, an exhausted stdin fails rather than quietly keeping every file: an empty stream has not declined anything. Answering `n` is a decision, and succeeds.
 
 ## Replica mode
 
@@ -184,6 +197,33 @@ the consequences of aiming at the wrong master are deletions.
 - **Migrate to master** — master does not have this file; it will be uploaded and then removed locally.
 
 The plan is shown before any changes are made. Confirm with `y` to execute, or press Enter / type `n` to cancel.
+
+`-y` runs the plan unattended, with one exception. Uploads happen and the local
+copies that this run put on the master are removed, because the content is in two
+places before anything is deleted locally. The **delete locally** entries are
+skipped: the master already had that content, so nothing would be left anywhere
+if the deletion turned out to be wrong. They stay listed in the plan, onley warns
+on stderr, and the run exits non-zero.
+
+```sh
+$ onley -y replica check
+Delete locally (already on master, 892 file(s)):
+  /my/files/photo_001.jpg
+  ...
+
+warning: 892 file(s) are already on the master and were left in place.
+         -y does not delete a local copy the master already has, because nothing
+         would be left anywhere if that turned out to be wrong.
+         The list above is what is waiting for a decision: delete them yourself,
+         or drop -y and confirm the plan interactively.
+
+Done: 0 deleted, 342 migrated, 0 failed.
+$ echo $?
+1
+```
+
+To let a scheduled run delete them, review the list first. Removing `-y` and
+answering `y` is the interactive path and still deletes everything in the plan.
 
 ```
 Comparing 1 234 file(s) with master...
