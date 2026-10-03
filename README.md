@@ -12,6 +12,7 @@ A local file deduplication tool. Indexes files by MD5, finds duplicates, and let
 - SQLite index stored locally
 - Resume support: unchanged files (same size + mtime) are skipped on re-scan
 - Concurrent scanning via a configurable goroutine worker pool
+- Continuous indexing (`watch`): the index follows files as they are created, changed and deleted
 - Interactive cleanup (`clean`) or automatic cleanup (`clean-all`)
 - Multi-machine mode: a replica compares its local index against a master and either deletes local copies or migrates unique files to the master over HTTP
 
@@ -46,6 +47,9 @@ onley clean-all
 
 # Show index statistics
 onley stats
+
+# Or keep the index up to date while files change
+onley watch ~/Downloads
 ```
 
 ## Commands
@@ -53,6 +57,7 @@ onley stats
 | Command | Description |
 |---|---|
 | `scan <dir>` | Walk `dir` and index every file by MD5 |
+| `watch <dir>` | Keep the index current as files under `dir` change |
 | `dupes` | List all duplicate groups |
 | `clean` | Interactive: choose which files to keep per group |
 | `clean-all` | Non-interactive: keep the first file per group, delete the rest |
@@ -75,6 +80,27 @@ onley -workers 4 scan /Volumes/data
 ```
 
 Progress is shown per worker. A second scan over the same directory skips files whose size and modification time are unchanged, so interrupted scans resume cheaply.
+
+## Watch
+
+`watch` keeps the index current without being run again:
+
+```sh
+onley watch ~/Downloads
+onley watch -debounce 2s /Volumes/data
+```
+
+| Flag | Default | Description |
+|---|---|---|
+| `-debounce <dur>` | `500ms` | How long a file must stop changing before it is indexed |
+
+It covers the whole directory tree, the same way `scan` does, and it indexes the files that are already there on startup. New subdirectories are picked up as they appear.
+
+`watch` only maintains the index. When a file is deleted or renamed away, its index entry is dropped, but nothing is deleted from disk — cleaning up is still `clean` and `clean-all`.
+
+A file is indexed once it stops changing for `-debounce`, and its size and modification time are checked again when the window closes, so a file that grows while the watcher waits is not hashed mid-write. Raise `-debounce` if your files are written in bursts with long pauses: a writer that pauses for longer than the window looks like a writer that finished.
+
+Other commands can run against the same index while `watch` is running. Stop it with Ctrl-C.
 
 ## Clean
 

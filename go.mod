@@ -2,7 +2,10 @@ module onley
 
 go 1.26.4
 
-require modernc.org/sqlite v1.52.0
+require (
+	github.com/fsnotify/fsnotify v1.10.1
+	modernc.org/sqlite v1.52.0
+)
 
 require (
 	github.com/dustin/go-humanize v1.0.1 // indirect

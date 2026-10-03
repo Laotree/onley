@@ -2,20 +2,24 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"flag"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"syscall"
 	"time"
 
 	"onley/internal/db"
 	"onley/internal/replica"
 	"onley/internal/scanner"
 	"onley/internal/ui"
+	"onley/internal/watcher"
 )
 
 const defaultDBFile = "onley.db"
@@ -33,6 +37,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "Usage: onley [options] <subcommand> [args]\n\n")
 		fmt.Fprintf(stderr, "Subcommands:\n")
 		fmt.Fprintf(stderr, "  scan <dir>           index files in a directory\n")
+		fmt.Fprintf(stderr, "  watch <dir>          keep the index up to date as files change\n")
 		fmt.Fprintf(stderr, "  dupes                list all duplicate files\n")
 		fmt.Fprintf(stderr, "  clean                interactively remove duplicates\n")
 		fmt.Fprintf(stderr, "  clean-all            keep first file per group, delete the rest (with confirmation)\n")
@@ -60,6 +65,12 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 			return 1
 		}
 		return cmdScan(*dbPath, rest[1], *workers, stdout, stderr)
+	case "watch":
+		if len(rest) < 2 {
+			fmt.Fprintln(stderr, "error: watch requires a directory argument")
+			return 1
+		}
+		return cmdWatch(*dbPath, rest[1], rest[2:], stdout, stderr)
 	case "dupes":
 		return cmdDupes(*dbPath, stdout, stderr)
 	case "clean":
@@ -174,6 +185,92 @@ func cmdScan(dbPath, dir string, workers int, stdout, stderr io.Writer) int {
 	if errCount > 0 {
 		fmt.Fprintf(stdout, "  (%d file(s) skipped due to errors)\n", errCount)
 	}
+	return 0
+}
+
+func cmdWatch(dbPath, dir string, args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("watch", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	debounce := fs.Duration("debounce", watcher.DefaultDebounce, "how long a file must stop changing before it is indexed")
+	if err := fs.Parse(args); err != nil {
+		return 1
+	}
+
+	absDir, err := filepath.Abs(dir)
+	if err != nil {
+		fmt.Fprintf(stderr, "failed to resolve path: %v\n", err)
+		return 1
+	}
+	info, err := os.Stat(absDir)
+	if err != nil {
+		fmt.Fprintf(stderr, "directory not found: %v\n", err)
+		return 1
+	}
+	if !info.IsDir() {
+		fmt.Fprintf(stderr, "not a directory: %s\n", absDir)
+		return 1
+	}
+
+	w, err := watcher.New(absDir, *debounce)
+	if err != nil {
+		fmt.Fprintf(stderr, "failed to watch %s: %v\n", absDir, err)
+		return 1
+	}
+	defer w.Close()
+
+	store := openDB(dbPath, stderr)
+	if store == nil {
+		return 1
+	}
+	defer store.Close()
+
+	// The watcher stops on the first interrupt so the deferred Close and store
+	// Close run and the index is left consistent.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	go w.Run(ctx)
+
+	fmt.Fprintf(stdout, "Watching %s (debounce %s). Press Ctrl-C to stop.\n", absDir, *debounce)
+
+	var indexed, removed, failed int
+	for ev := range w.Events() {
+		if ev.Err != nil {
+			fmt.Fprintf(stderr, "  warning: %v\n", ev.Err)
+			failed++
+			continue
+		}
+		if ev.Remove {
+			// Only the index record goes. The file is already gone, or the
+			// rename moved it, and deleting anything here could destroy a file
+			// the user still has.
+			if err := store.DeleteRecord(ev.Path); err != nil {
+				fmt.Fprintf(stderr, "  index cleanup failed %s: %v\n", ev.Path, err)
+				failed++
+				continue
+			}
+			removed++
+			fmt.Fprintf(stdout, "  removed  %s\n", ev.Path)
+			continue
+		}
+		if err := scanner.IndexFile(ev.Path, store); err != nil {
+			fmt.Fprintf(stderr, "  index failed %s: %v\n", ev.Path, err)
+			failed++
+			continue
+		}
+		indexed++
+		fmt.Fprintf(stdout, "  indexed  %s\n", ev.Path)
+	}
+
+	// Report what the run did, so a long watch that is stopped from another
+	// terminal still leaves a record of its work.
+	total, dups, err := store.Stats()
+	if err != nil {
+		fmt.Fprintf(stderr, "  stats failed on shutdown: %v\n", err)
+		return 1
+	}
+	fmt.Fprintf(stdout, "\nStopped: %d indexed, %d removed, %d failed. Index holds %d file(s), %d with duplicates.\n",
+		indexed, removed, failed, total, dups)
 	return 0
 }
 
