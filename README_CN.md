@@ -72,6 +72,13 @@ onley watch ~/Downloads
 |---|---|---|
 | `-db <path>` | `~/.onley/local.db` | SQLite 数据库文件路径 |
 | `-workers <n>` | `max(1, CPU数-1)` | 并发 hash worker 数量 |
+| `-y`、`--yes` | 关闭 | 对确认一律回答 yes |
+
+选项要放在子命令之前：`onley -y clean-all`，而不是 `onley clean-all -y`。
+
+`-y` 是「照计划执行」的许可，不是「随意销毁」的许可。在多机模式下，只有当本次运行
+已经把该内容上传到 master 时，它才授权删除本地副本；master 早就有的文件一律保留、
+在 stderr 警告，并以非 0 退出，因为有活留给人。详见[多机模式](#多机模式replica)。
 
 默认索引放在 home 目录下，这样任何目录看到的是同一份索引：在 `~/Downloads`
 里 `onley scan`，换个目录再 `onley stats`，仍然能看到扫描结果。该目录不存在
@@ -124,13 +131,20 @@ onley watch -debounce 2s /Volumes/data
 Keep number(s) (e.g. 1 or 1,2; Enter to skip): 1
 ```
 
-`clean-all` 每组按路径字母顺序保留第一个文件，一次确认后删除其余文件。它不是无人值守命令：它会问一次，在 cron 里 stdin 为空时直接失败，而不是悄悄地把所有文件都留着。需要脚本化就喂一个答案：
+`clean-all` 每组按路径字母顺序保留第一个文件，一次确认后删除其余文件。
+
+`-y` 跳过这次确认，也就是让 `clean-all` 能在 cron 里 stdin 为空时无人值守地跑：
 
 ```sh
-echo y | onley clean-all
+onley -y clean-all
 ```
 
-`clean` 与 `clean-all` 会区分「stdin 读到 EOF」和「明确答 n」。空输入流并没有拒绝任何东西，所以这种情况判为失败且不删除任何文件；答 `n` 是一个决定，视为成功。
+`-y` 不会代替 `clean` 的逐组选择。「每组保留哪一个」正是这个命令存在的理由，替你回答
+就等于选了一个和你想要的不一样的删除目标。所以 `onley -y clean` 仍然读 stdin 来收集
+选择，只跳过最后那一次 yes/no。
+
+不带 `-y` 时，stdin 读到 EOF 会直接失败，而不是悄悄地把所有文件都留着 —— 空输入流
+并没有拒绝任何东西。答 `n` 是一个决定，视为成功。
 
 ## 多机模式（Replica）
 
@@ -178,6 +192,31 @@ onley replica check
 - **迁移到 master** — master 没有该文件，将上传至 master 后删除本地副本。
 
 执行前会完整展示计划，输入 `y` 确认，按回车或输入 `n` 取消。
+
+`-y` 会无人值守地执行计划，但有一个例外：上传照常进行，本次已上传到 master 的那些
+本地副本会被删除 —— 因为删之前内容已经在两处。而 **「删除本地副本」** 那一类会被跳过：
+master 本来就有那份内容，如果删除结果证明是错的，就什么都留不下了。它们仍然列在计划里，
+onley 在 stderr 上警告，并以非 0 退出。
+
+```sh
+$ onley -y replica check
+Delete locally (already on master, 892 file(s)):
+  /my/files/photo_001.jpg
+  ...
+
+warning: 892 file(s) are already on the master and were left in place.
+         -y does not delete a local copy the master already has, because nothing
+         would be left anywhere if that turned out to be wrong.
+         The list above is what is waiting for a decision: delete them yourself,
+         or drop -y and confirm the plan interactively.
+
+Done: 0 deleted, 342 migrated, 0 failed.
+$ echo $?
+1
+```
+
+要让定时任务也删掉它们，请先过一遍那份清单。去掉 `-y` 并输入 `y` 是交互路径，
+仍然会删除计划里的全部内容。
 
 ```
 Comparing 1 234 file(s) with master...

@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"crypto/md5"
 	"fmt"
 	"net/http/httptest"
 	"os"
@@ -1789,4 +1790,206 @@ func TestResolveMaster(t *testing.T) {
 			}
 		})
 	}
+}
+
+// --- -y ---
+
+// seedDupes indexes two identical files and returns the directory and the index.
+func seedDupes(t *testing.T) (dir, dbFile string) {
+	t.Helper()
+	dir = t.TempDir()
+	dbFile = filepath.Join(t.TempDir(), "local.db")
+	for _, name := range []string{"a.txt", "b.txt"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("same\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, _, code := runCmd("-db", dbFile, "scan", dir); code != 0 {
+		t.Fatal("scan failed")
+	}
+	return dir, dbFile
+}
+
+// TestCleanAll_YesNeedsNoStdin is the case -y exists for.
+func TestCleanAll_YesNeedsNoStdin(t *testing.T) {
+	dir, dbFile := seedDupes(t)
+	t.Chdir(t.TempDir())
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"-y", "-db", dbFile, "clean-all"}, strings.NewReader(""), &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("clean-all with -y exited %d: %s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "Done: 1 deleted") {
+		t.Errorf("clean-all with -y did not delete: %s", stdout.String())
+	}
+	if strings.Contains(stdout.String(), "Confirm deletion?") {
+		t.Errorf("-y still prompted: %s", stdout.String())
+	}
+	if _, err := os.Stat(filepath.Join(dir, "b.txt")); err == nil {
+		t.Error("the duplicate was not removed")
+	}
+}
+
+// TestClean_YesStillAsksWhichToKeep keeps -y from standing in for the decision
+// that is the point of the interactive command.
+func TestClean_YesStillAsksWhichToKeep(t *testing.T) {
+	dir, dbFile := seedDupes(t)
+	t.Chdir(t.TempDir())
+
+	var stdout, stderr bytes.Buffer
+	// Keep the first file, so the second is the deletion candidate.
+	code := run([]string{"-y", "-db", dbFile, "clean"}, strings.NewReader("1\n"), &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("clean with -y exited %d: %s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "Keep number(s)") {
+		t.Errorf("-y skipped the per-group question: %s", stdout.String())
+	}
+	if strings.Contains(stdout.String(), "Confirm deletion?") {
+		t.Errorf("-y should have skipped the final confirmation: %s", stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "Done: 1 deleted") {
+		t.Errorf("clean with -y did not delete: %s", stdout.String())
+	}
+	if _, err := os.Stat(filepath.Join(dir, "b.txt")); err == nil {
+		t.Error("the chosen duplicate was not removed")
+	}
+}
+
+// TestFlagsAfterSubcommandAreRejected: `onley clean-all -y` used to be silently
+// dropped, which reads as "-y did nothing" rather than "wrong place".
+func TestFlagsAfterSubcommandAreRejected(t *testing.T) {
+	_, dbFile := seedDupes(t)
+	t.Chdir(t.TempDir())
+
+	for _, args := range [][]string{
+		{"-db", dbFile, "clean-all", "-y"},
+		{"-db", dbFile, "clean", "-y"},
+		{"-db", dbFile, "stats", "-json"},
+	} {
+		var stdout, stderr bytes.Buffer
+		if code := run(args, strings.NewReader(""), &stdout, &stderr); code == 0 {
+			t.Errorf("%v was accepted", args)
+		}
+		if !strings.Contains(stderr.String(), "options go before the subcommand") {
+			t.Errorf("%v: the error should say where options belong; got: %s", args, stderr.String())
+		}
+	}
+}
+
+// TestRejectExtraArgs_HintOnlyForFlags keeps the hint from appearing for a plain
+// stray argument, where it would be noise.
+func TestRejectExtraArgs_HintOnlyForFlags(t *testing.T) {
+	err := rejectExtraArgs([]string{"stray"})
+	if err == nil {
+		t.Fatal("a stray argument was accepted")
+	}
+	if strings.Contains(err.Error(), "options go before") {
+		t.Errorf("a non-flag argument should not get the placement hint: %v", err)
+	}
+}
+
+// TestReplicaCheck_YesUploadsButKeepsMasterCopies is the safety rule: -y carries
+// out the uploads and leaves alone the deletions nothing would survive.
+//
+// The two files hold different content on purpose. Two identical files share one
+// MD5, so putting either on the master makes both of them redundant and there
+// would be nothing left to migrate.
+func TestReplicaCheck_YesUploadsButKeepsMasterCopies(t *testing.T) {
+	masterURL, masterDB := newMasterServer(t)
+
+	dir := t.TempDir()
+	dbFile := filepath.Join(t.TempDir(), "local.db")
+	held := filepath.Join(dir, "already-on-master.txt")
+	unique := filepath.Join(dir, "unique.txt")
+	if err := os.WriteFile(held, []byte("content the master already has\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(unique, []byte("content only here\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, code := runCmd("-db", dbFile, "scan", dir); code != 0 {
+		t.Fatal("scan failed")
+	}
+	if err := replica.NewClient(masterURL).Ingest(held, md5OfFile(t, held)); err != nil {
+		t.Fatalf("seeding the master: %v", err)
+	}
+	if files, err := masterDB.FindByMD5(md5OfFile(t, held)); err != nil || len(files) == 0 {
+		t.Fatalf("the master does not hold the seeded content: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"-y", "-db", dbFile, "replica", "check", "-master", masterURL},
+		strings.NewReader(""), &stdout, &stderr)
+
+	// The upload happened, and the local copy went with it.
+	if !strings.Contains(stdout.String(), "1 migrated") {
+		t.Errorf("-y did not carry out the migration:\nstdout: %s\nstderr: %s", stdout.String(), stderr.String())
+	}
+	if _, err := os.Stat(unique); err == nil {
+		t.Error("the migrated file is still on disk after -y")
+	}
+
+	// The deletion did not, and its record is still indexed.
+	if _, err := os.Stat(held); err != nil {
+		t.Errorf("-y deleted a local copy the master already had: %v", err)
+	}
+	local, err := db.Open(dbFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer local.Close()
+	if rec, err := local.Lookup(held); err != nil || rec == nil {
+		t.Errorf("the record for the master-held file was dropped: rec=%v err=%v", rec, err)
+	}
+
+	if code == 0 {
+		t.Error("exit code 0 with a file left for a person to decide")
+	}
+	if !strings.Contains(stderr.String(), "already on the master") {
+		t.Errorf("the warning should say what was left alone: %s", stderr.String())
+	}
+	if strings.Contains(stdout.String(), "Proceed with the above?") {
+		t.Errorf("-y still prompted: %s", stdout.String())
+	}
+}
+
+// TestReplicaCheck_WithoutYesStillDeletesEverything keeps the interactive path
+// unchanged by -y: answering y there still removes the master-held copies.
+func TestReplicaCheck_WithoutYesStillDeletesEverything(t *testing.T) {
+	masterURL, _ := newMasterServer(t)
+	dir, dbFile := seedDupes(t)
+	for _, name := range []string{"a.txt", "b.txt"} {
+		p := filepath.Join(dir, name)
+		if err := replica.NewClient(masterURL).Ingest(p, md5OfFile(t, p)); err != nil {
+			t.Fatalf("seeding the master with %s: %v", name, err)
+		}
+	}
+
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"-db", dbFile, "replica", "check", "-master", masterURL},
+		strings.NewReader("y\n"), &stdout, &stderr); code != 0 {
+		t.Fatalf("replica check exited %d: %s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "Proceed with the above?") {
+		t.Errorf("the interactive path should still prompt: %s", stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "2 deleted") {
+		t.Errorf("an interactive confirmation should still delete: %s", stdout.String())
+	}
+	for _, name := range []string{"a.txt", "b.txt"} {
+		if _, err := os.Stat(filepath.Join(dir, name)); err == nil {
+			t.Errorf("%s survived an interactive confirmation", name)
+		}
+	}
+}
+
+func md5OfFile(t *testing.T, path string) string {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return fmt.Sprintf("%x", md5.Sum(data))
 }

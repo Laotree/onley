@@ -53,6 +53,12 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	// The default stays empty so an explicit -db is distinguishable from an
 	// omitted one, and so PrintDefaults does not print a stale path.
 	dbPath := fs.String("db", "", "SQLite database path (default: ~/"+dbDirName+"/"+dbFileName+")")
+	// Both spellings are registered because the flag package derives the name
+	// from a single string: "yes" gives -yes and --yes, and "y" gives -y and
+	// --y. Registering both is cheaper than making people remember which one
+	// this particular tool chose.
+	shortYes := fs.Bool("y", false, "assume yes for confirmations")
+	longYes := fs.Bool("yes", false, "same as -y")
 	workers := fs.Int("workers", max(1, runtime.NumCPU()-1), "number of concurrent workers")
 	fs.Usage = func() {
 		fmt.Fprintf(stderr, "Usage: onley [options] <subcommand> [args]\n\n")
@@ -79,6 +85,9 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		fs.Usage()
 		return 1
 	}
+	// Combined after parsing: reading the two flags before Parse would always see
+	// their zero values.
+	yes := *shortYes || *longYes
 
 	// Resolved after the subcommand is known, so printing usage or rejecting a
 	// bad flag does not create a home directory as a side effect.
@@ -115,10 +124,22 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		}
 		return cmdDupes(*dbPath, stdout, stderr)
 	case "clean":
-		return cmdClean(*dbPath, stdin, stdout, stderr)
+		if err := rejectExtraArgs(rest[1:]); err != nil {
+			fmt.Fprintf(stderr, "error: %v\n", err)
+			return 1
+		}
+		return cmdClean(*dbPath, yes, stdin, stdout, stderr)
 	case "clean-all":
-		return cmdCleanAll(*dbPath, stdin, stdout, stderr)
+		if err := rejectExtraArgs(rest[1:]); err != nil {
+			fmt.Fprintf(stderr, "error: %v\n", err)
+			return 1
+		}
+		return cmdCleanAll(*dbPath, yes, stdin, stdout, stderr)
 	case "stats":
+		if err := rejectExtraArgs(rest[1:]); err != nil {
+			fmt.Fprintf(stderr, "error: %v\n", err)
+			return 1
+		}
 		return cmdStats(*dbPath, stdout, stderr)
 	case "config":
 		if len(rest) < 2 {
@@ -135,7 +156,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		}
 		switch rest[1] {
 		case "check":
-			return cmdReplicaCheck(*dbPath, rest[2:], stdin, stdout, stderr)
+			return cmdReplicaCheck(*dbPath, yes, rest[2:], stdin, stdout, stderr)
 		default:
 			fmt.Fprintf(stderr, "unknown replica subcommand: %s\n", rest[1])
 			return 1
@@ -153,13 +174,27 @@ func rejectExtraArgs(extra []string) error {
 		return nil
 	}
 	quoted := make([]string, len(extra))
+	looksLikeFlag := false
 	for i, a := range extra {
 		quoted[i] = strconv.Quote(a)
+		if strings.HasPrefix(a, "-") && a != "-" {
+			looksLikeFlag = true
+		}
 	}
+	var err error
 	if len(extra) == 1 {
-		return fmt.Errorf("unexpected argument %s", quoted[0])
+		err = fmt.Errorf("unexpected argument %s", quoted[0])
+	} else {
+		err = fmt.Errorf("unexpected arguments %s", strings.Join(quoted, ", "))
 	}
-	return fmt.Errorf("unexpected arguments %s", strings.Join(quoted, ", "))
+	if looksLikeFlag {
+		// Options are parsed before the subcommand, so `onley clean-all -y`
+		// arrives here as a positional argument. Without this the flag would be
+		// silently dropped and the command would run as if it were absent, which
+		// reads as "-y did nothing" rather than "the flag is in the wrong place".
+		return fmt.Errorf("%w; options go before the subcommand, e.g.: onley -y clean-all", err)
+	}
+	return err
 }
 
 // rejectExtraDirs refuses directory arguments a command cannot act on.
@@ -508,7 +543,7 @@ func cmdDupes(dbPath string, stdout, stderr io.Writer) int {
 	return 0
 }
 
-func cmdClean(dbPath string, stdin io.Reader, stdout, stderr io.Writer) int {
+func cmdClean(dbPath string, assumeYes bool, stdin io.Reader, stdout, stderr io.Writer) int {
 	store := openDB(dbPath, stderr)
 	if store == nil {
 		return 1
@@ -527,6 +562,9 @@ func cmdClean(dbPath string, stdin io.Reader, stdout, stderr io.Writer) int {
 
 	ui.ShowDuplicatesW(groups, stdout)
 	br := bufio.NewReader(stdin)
+	// -y does not stand in for the per-group choice. Deciding which copy to keep
+	// is the whole point of this command, and answering it on the user's behalf
+	// would silently pick a different deletion target than the one they wanted.
 	toDelete, err := ui.CleanInteractive(groups, stdout, br)
 	if code := reportNoInput(err, stderr); code >= 0 {
 		return code
@@ -536,13 +574,15 @@ func cmdClean(dbPath string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return 0
 	}
 
-	confirmed, err := ui.ConfirmDelete(toDelete, stdout, br)
-	if code := reportNoInput(err, stderr); code >= 0 {
-		return code
-	}
-	if !confirmed {
-		fmt.Fprintln(stdout, "Cancelled.")
-		return 0
+	if !assumeYes {
+		confirmed, err := ui.ConfirmDelete(toDelete, stdout, br)
+		if code := reportNoInput(err, stderr); code >= 0 {
+			return code
+		}
+		if !confirmed {
+			fmt.Fprintln(stdout, "Cancelled.")
+			return 0
+		}
 	}
 
 	var deleted, failed int
@@ -561,7 +601,7 @@ func cmdClean(dbPath string, stdin io.Reader, stdout, stderr io.Writer) int {
 	return 0
 }
 
-func cmdCleanAll(dbPath string, stdin io.Reader, stdout, stderr io.Writer) int {
+func cmdCleanAll(dbPath string, assumeYes bool, stdin io.Reader, stdout, stderr io.Writer) int {
 	store := openDB(dbPath, stderr)
 	if store == nil {
 		return 1
@@ -596,13 +636,15 @@ func cmdCleanAll(dbPath string, stdin io.Reader, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stdout)
 	}
 
-	confirmed, err := ui.ConfirmDelete(toDelete, stdout, bufio.NewReader(stdin))
-	if code := reportNoInput(err, stderr); code >= 0 {
-		return code
-	}
-	if !confirmed {
-		fmt.Fprintln(stdout, "Cancelled.")
-		return 0
+	if !assumeYes {
+		confirmed, err := ui.ConfirmDelete(toDelete, stdout, bufio.NewReader(stdin))
+		if code := reportNoInput(err, stderr); code >= 0 {
+			return code
+		}
+		if !confirmed {
+			fmt.Fprintln(stdout, "Cancelled.")
+			return 0
+		}
 	}
 
 	var deleted, failed int
@@ -787,7 +829,7 @@ func cmdServe(dbPath string, args []string, stdout, stderr io.Writer) int {
 	return 0
 }
 
-func cmdReplicaCheck(dbPath string, args []string, stdin io.Reader, stdout, stderr io.Writer) int {
+func cmdReplicaCheck(dbPath string, assumeYes bool, args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("replica check", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	masterURL := fs.String("master", "", "master address (e.g. http://master-host:8080)")
@@ -881,24 +923,40 @@ func cmdReplicaCheck(dbPath string, args []string, stdin io.Reader, stdout, stde
 		}
 	}
 
-	fmt.Fprintf(stdout, "\nProceed with the above? [y/N] ")
-	br := bufio.NewReader(stdin)
-	line, readErr := br.ReadString('\n')
-	// The plan above ends in deletions, so an input that never arrives has to be
-	// a failure rather than a quiet "no".
-	if readErr != nil && strings.TrimSpace(line) == "" {
-		if code := reportNoInput(ui.ErrNoInput, stderr); code >= 0 {
-			return code
+	if !assumeYes {
+		fmt.Fprintf(stdout, "\nProceed with the above? [y/N] ")
+		br := bufio.NewReader(stdin)
+		line, readErr := br.ReadString('\n')
+		// The plan above ends in deletions, so an input that never arrives has to
+		// be a failure rather than a quiet "no".
+		if readErr != nil && strings.TrimSpace(line) == "" {
+			if code := reportNoInput(ui.ErrNoInput, stderr); code >= 0 {
+				return code
+			}
+		}
+		if strings.TrimSpace(strings.ToLower(line)) != "y" {
+			fmt.Fprintln(stdout, "Cancelled.")
+			return 0
 		}
 	}
-	if strings.TrimSpace(strings.ToLower(line)) != "y" {
-		fmt.Fprintln(stdout, "Cancelled.")
-		return 0
+
+	// -y is permission to carry out the plan, not permission to destroy. The
+	// entries where the master already holds the content have nothing behind
+	// them: no upload happens, and removing the local copy is the last copy of
+	// nothing else. Those stay for a person to decide on, which is also why this
+	// run exits non-zero: it did not finish what it was asked.
+	skipped := 0
+	if assumeYes && len(toDelete) > 0 {
+		skipped = len(toDelete)
+		warnSkippedDeletes(toDelete, skipped, stderr)
 	}
 
 	var deleted, migrated, failed int
 
 	for _, e := range toDelete {
+		if skipped > 0 {
+			break
+		}
 		if err := os.Remove(e.Path); err != nil {
 			fmt.Fprintf(stderr, "  delete failed %s: %v\n", e.Path, err)
 			failed++
@@ -909,6 +967,8 @@ func cmdReplicaCheck(dbPath string, args []string, stdin io.Reader, stdout, stde
 	}
 
 	for _, e := range toMigrate {
+		// Uploading first is what makes removing the local copy safe: the content
+		// is on the master before anything is deleted here.
 		if err := client.Ingest(e.Path, e.MD5); err != nil {
 			fmt.Fprintf(stderr, "  migrate failed %s: %v\n", e.Path, err)
 			failed++
@@ -922,5 +982,18 @@ func cmdReplicaCheck(dbPath string, args []string, stdin io.Reader, stdout, stde
 	}
 
 	fmt.Fprintf(stdout, "\nDone: %d deleted, %d migrated, %d failed.\n", deleted, migrated, failed)
+	if skipped > 0 {
+		return 1
+	}
 	return 0
+}
+
+// warnSkippedDeletes explains what -y refused to do and what to do instead. The
+// paths are not repeated: the plan above already lists every one of them.
+func warnSkippedDeletes(toDelete []replica.PlanEntry, skipped int, stderr io.Writer) {
+	fmt.Fprintf(stderr, "\nwarning: %d file(s) are already on the master and were left in place.\n", skipped)
+	fmt.Fprintln(stderr, "         -y does not delete a local copy the master already has, because nothing")
+	fmt.Fprintln(stderr, "         would be left anywhere if that turned out to be wrong.")
+	fmt.Fprintln(stderr, "         The list above is what is waiting for a decision: delete them yourself,")
+	fmt.Fprintln(stderr, "         or drop -y and confirm the plan interactively.")
 }
