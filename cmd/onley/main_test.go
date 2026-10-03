@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"onley/internal/config"
 	"onley/internal/db"
 	"onley/internal/replica"
 )
@@ -547,9 +548,18 @@ func newMasterServer(t *testing.T) (string, *db.DB) {
 }
 
 func TestRun_ReplicaCheckNoMaster(t *testing.T) {
-	_, _, code := runCmd("-db", filepath.Join(t.TempDir(), "local.db"), "replica", "check")
+	fakeHome(t)
+	t.Chdir(t.TempDir())
+
+	_, stderr, code := runCmd("-db", filepath.Join(t.TempDir(), "local.db"), "replica", "check")
 	if code == 0 {
-		t.Error("replica check without -master should fail")
+		t.Error("replica check without any master should fail")
+	}
+	// The hint is what turns this from "it broke" into "here is what to do".
+	for _, want := range []string{"-master", masterEnvVar, "config set master"} {
+		if !strings.Contains(stderr, want) {
+			t.Errorf("the error should mention %q; got: %s", want, stderr)
+		}
 	}
 }
 
@@ -1490,5 +1500,293 @@ func TestCleanAll_PipedYesStillDeletes(t *testing.T) {
 	kept, _, _ := runCmd("-db", dbFile, "stats")
 	if !strings.Contains(kept, "Total indexed: 1") {
 		t.Errorf("the piped confirmation did not take effect: %s", kept)
+	}
+}
+
+// --- config and master resolution ---
+
+// configPath returns the settings file for a test with a temporary home.
+func configPath(t *testing.T) string {
+	t.Helper()
+	return filepath.Join(fakeHome(t), dbDirName, configFileName)
+}
+
+// TestConfig_SetThenShow covers the write path and the read path together.
+func TestConfig_SetThenShow(t *testing.T) {
+	path := configPath(t)
+	t.Chdir(t.TempDir())
+
+	stdout, stderr, code := runCmd("config", "set", "master", "http://master-host:8080")
+	if code != 0 {
+		t.Fatalf("config set failed: %d, stderr: %s", code, stderr)
+	}
+	if !strings.Contains(stdout, "http://master-host:8080") {
+		t.Errorf("config set should echo the value: %s", stdout)
+	}
+
+	stdout, stderr, code = runCmd("config", "show")
+	if code != 0 {
+		t.Fatalf("config show failed: %d, stderr: %s", code, stderr)
+	}
+	if !strings.Contains(stdout, path) {
+		t.Errorf("config show should name the file: %s", stdout)
+	}
+	if !strings.Contains(stdout, "http://master-host:8080") {
+		t.Errorf("config show should print the value: %s", stdout)
+	}
+}
+
+// TestConfig_SetValidatesURL keeps a typo out of the file, because a wrong URL
+// stored once is a wrong URL used until someone notices.
+func TestConfig_SetValidatesURL(t *testing.T) {
+	t.Chdir(t.TempDir())
+	for _, bad := range []string{"", "master-host:8080", "ftp://host", "http://", "://x"} {
+		stdout, stderr, code := runCmd("config", "set", "master", bad)
+		if code == 0 {
+			t.Errorf("config set accepted %q", bad)
+		}
+		if !strings.Contains(stderr, "error:") {
+			t.Errorf("config set %q should explain itself; got stdout=%s stderr=%s", bad, stdout, stderr)
+		}
+	}
+}
+
+func TestConfig_SetRejectsUnknownKey(t *testing.T) {
+	t.Chdir(t.TempDir())
+	_, stderr, code := runCmd("config", "set", "mastser", "http://host:8080")
+	if code == 0 {
+		t.Error("config set accepted a misspelled key")
+	}
+	if !strings.Contains(stderr, "master") {
+		t.Errorf("the error should name the valid key; got: %s", stderr)
+	}
+}
+
+func TestConfig_SetRejectsExtraArgs(t *testing.T) {
+	t.Chdir(t.TempDir())
+	_, _, code := runCmd("config", "set", "master", "http://host:8080", "extra")
+	if code == 0 {
+		t.Error("config set accepted a third argument")
+	}
+}
+
+func TestConfig_SetMissingValue(t *testing.T) {
+	t.Chdir(t.TempDir())
+	_, stderr, code := runCmd("config", "set", "master")
+	if code == 0 {
+		t.Error("config set accepted a key with no value")
+	}
+	if !strings.Contains(stderr, "value") {
+		t.Errorf("the error should mention the missing value; got: %s", stderr)
+	}
+}
+
+func TestConfig_UnknownSubcommand(t *testing.T) {
+	t.Chdir(t.TempDir())
+	_, stderr, code := runCmd("config", "frobnicate")
+	if code == 0 {
+		t.Error("config accepted an unknown subcommand")
+	}
+	if !strings.Contains(stderr, "frobnicate") {
+		t.Errorf("the error should name the subcommand; got: %s", stderr)
+	}
+}
+
+// TestConfig_MissingSubcommand covers `onley config` on its own.
+func TestConfig_MissingSubcommand(t *testing.T) {
+	t.Chdir(t.TempDir())
+	_, stderr, code := runCmd("config")
+	if code == 0 {
+		t.Error("config without a subcommand should fail")
+	}
+	if !strings.Contains(stderr, "subcommand") {
+		t.Errorf("the error should ask for a subcommand; got: %s", stderr)
+	}
+}
+
+// TestConfig_ShowWithoutFile covers a machine that has configured nothing.
+func TestConfig_ShowWithoutFile(t *testing.T) {
+	t.Chdir(t.TempDir())
+	stdout, stderr, code := runCmd("config", "show")
+	if code != 0 {
+		t.Fatalf("config show on a fresh install failed: %d, %s", code, stderr)
+	}
+	if !strings.Contains(stdout, "not set") {
+		t.Errorf("config show should say nothing is set: %s", stdout)
+	}
+}
+
+// TestConfig_ShowReportsEnvOverride keeps the effective value visible, since
+// config show alone would report a value the command is not going to use.
+func TestConfig_ShowReportsEnvOverride(t *testing.T) {
+	t.Chdir(t.TempDir())
+	if _, _, code := runCmd("config", "set", "master", "http://from-file:1"); code != 0 {
+		t.Fatal("config set failed")
+	}
+	t.Setenv(masterEnvVar, "http://from-env:2")
+
+	stdout, _, code := runCmd("config", "show")
+	if code != 0 {
+		t.Fatalf("config show failed: %d", code)
+	}
+	if !strings.Contains(stdout, "http://from-env:2") {
+		t.Errorf("config show should report the environment override: %s", stdout)
+	}
+}
+
+// TestReplicaCheck_UsesConfiguredMaster is the point of the feature: the URL is
+// typed once.
+func TestReplicaCheck_UsesConfiguredMaster(t *testing.T) {
+	masterURL, _ := newMasterServer(t)
+	t.Chdir(t.TempDir())
+	if _, stderr, code := runCmd("config", "set", "master", masterURL); code != 0 {
+		t.Fatalf("config set failed: %s", stderr)
+	}
+
+	dbFile := filepath.Join(t.TempDir(), "local.db")
+	store, err := db.Open(dbFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.Close()
+
+	stdout, stderr, code := runCmd("-db", dbFile, "replica", "check")
+	if code != 0 {
+		t.Fatalf("replica check without -master failed: %d, stderr: %s", code, stderr)
+	}
+	if !strings.Contains(stdout, "Local index is empty") {
+		t.Errorf("the configured master was not used: %s", stdout)
+	}
+	// The source is printed, because a stale URL in the file is otherwise
+	// invisible and the failure looks like an unreachable master.
+	if !strings.Contains(stdout, "from config") {
+		t.Errorf("replica check should say where the master came from: %s", stdout)
+	}
+}
+
+// TestReplicaCheck_FlagBeatsConfig covers the documented precedence.
+func TestReplicaCheck_FlagBeatsConfig(t *testing.T) {
+	masterURL, _ := newMasterServer(t)
+	t.Chdir(t.TempDir())
+	// A config value that cannot be reached: if the flag wins, this succeeds.
+	if _, stderr, code := runCmd("config", "set", "master", "http://127.0.0.1:1"); code != 0 {
+		t.Fatalf("config set failed: %s", stderr)
+	}
+
+	dbFile := filepath.Join(t.TempDir(), "local.db")
+	store, err := db.Open(dbFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.Close()
+
+	stdout, stderr, code := runCmd("-db", dbFile, "replica", "check", "-master", masterURL)
+	if code != 0 {
+		t.Fatalf("the flag did not win: %d, stderr: %s", code, stderr)
+	}
+	if !strings.Contains(stdout, "from flag") {
+		t.Errorf("replica check should report the flag as the source: %s", stdout)
+	}
+}
+
+// TestReplicaCheck_EnvBeatsConfig covers the middle of the precedence chain.
+func TestReplicaCheck_EnvBeatsConfig(t *testing.T) {
+	masterURL, _ := newMasterServer(t)
+	t.Chdir(t.TempDir())
+	if _, stderr, code := runCmd("config", "set", "master", "http://127.0.0.1:1"); code != 0 {
+		t.Fatalf("config set failed: %s", stderr)
+	}
+	t.Setenv(masterEnvVar, masterURL)
+
+	dbFile := filepath.Join(t.TempDir(), "local.db")
+	store, err := db.Open(dbFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.Close()
+
+	stdout, stderr, code := runCmd("-db", dbFile, "replica", "check")
+	if code != 0 {
+		t.Fatalf("the environment did not win: %d, stderr: %s", code, stderr)
+	}
+	if !strings.Contains(stdout, masterEnvVar) {
+		t.Errorf("replica check should report the environment as the source: %s", stdout)
+	}
+}
+
+// TestReplicaCheck_EmptyFlagFallsThrough covers -master "" being the same as
+// omitting it, rather than an error or a way to ignore the configuration.
+func TestReplicaCheck_EmptyFlagFallsThrough(t *testing.T) {
+	masterURL, _ := newMasterServer(t)
+	t.Chdir(t.TempDir())
+	if _, stderr, code := runCmd("config", "set", "master", masterURL); code != 0 {
+		t.Fatalf("config set failed: %s", stderr)
+	}
+
+	dbFile := filepath.Join(t.TempDir(), "local.db")
+	store, err := db.Open(dbFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.Close()
+
+	stdout, stderr, code := runCmd("-db", dbFile, "replica", "check", "-master", "")
+	if code != 0 {
+		t.Fatalf("an empty -master should fall through: %d, stderr: %s", code, stderr)
+	}
+	if !strings.Contains(stdout, "from config") {
+		t.Errorf("an empty -master should fall through to the config: %s", stdout)
+	}
+}
+
+// TestReplicaCheck_MalformedConfigIsFatal covers a file that exists but cannot
+// be parsed. Treating it as empty would silently aim the command at a master it
+// was never given.
+func TestReplicaCheck_MalformedConfigIsFatal(t *testing.T) {
+	path := configPath(t)
+	t.Chdir(t.TempDir())
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(`{"master": `), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	dbFile := filepath.Join(t.TempDir(), "local.db")
+	_, stderr, code := runCmd("-db", dbFile, "replica", "check")
+	if code == 0 {
+		t.Error("a malformed configuration was ignored")
+	}
+	if !strings.Contains(stderr, path) {
+		t.Errorf("the error should name the broken file; got: %s", stderr)
+	}
+}
+
+// TestResolveMaster covers the precedence directly, without a server.
+func TestResolveMaster(t *testing.T) {
+	t.Setenv(masterEnvVar, "")
+	cases := []struct {
+		name       string
+		flag       string
+		env        string
+		cfg        config.Config
+		wantURL    string
+		wantSource string
+	}{
+		{"nothing set", "", "", config.Config{}, "", ""},
+		{"config only", "", "", config.Config{Master: "http://c:1"}, "http://c:1", "config"},
+		{"env beats config", "", "http://e:2", config.Config{Master: "http://c:1"}, "http://e:2", masterEnvVar},
+		{"flag beats env", "http://f:3", "http://e:2", config.Config{Master: "http://c:1"}, "http://f:3", "flag"},
+		{"empty flag falls through", "", "http://e:2", config.Config{Master: "http://c:1"}, "http://e:2", masterEnvVar},
+		{"empty flag falls to config", "", "", config.Config{Master: "http://c:1"}, "http://c:1", "config"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv(masterEnvVar, tc.env)
+			gotURL, gotSource := resolveMaster(tc.flag, tc.cfg)
+			if gotURL != tc.wantURL || gotSource != tc.wantSource {
+				t.Errorf("resolveMaster = (%q, %q), want (%q, %q)", gotURL, gotSource, tc.wantURL, tc.wantSource)
+			}
+		})
 	}
 }

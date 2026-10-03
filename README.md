@@ -64,6 +64,7 @@ onley watch ~/Downloads
 | `stats` | Print total files and duplicate count |
 | `serve` | Start master HTTP server (for replica mode) |
 | `replica check` | Compare local index against a master, apply plan |
+| `config set` / `config show` | Store and display per-user settings |
 
 ## Global flags
 
@@ -148,12 +149,34 @@ onley -db /data/master.db serve -port 8080 -store /data/files
 | `-port <n>` | `8080` | Listen port |
 | `-store <dir>` | `onley-store` | Directory for incoming files |
 
-**On each replica**, scan local files then run a check:
+**On each replica**, point onley at the master once, then scan and check:
 
 ```sh
-onley -db local.db scan /my/files
-onley -db local.db replica check -master http://master-host:8080
+onley config set master http://master-host:8080
+onley scan /my/files
+onley replica check
 ```
+
+`replica check` needs to know which master to talk to, and that is fixed per
+machine, so it is remembered in `~/.onley/config.json` next to the index. It is
+still overridable per run:
+
+| Source | Example | Use for |
+|---|---|---|
+| `-master` | `onley replica check -master http://other:8080` | a one-off run against a different master |
+| `ONLEY_MASTER` | `ONLEY_MASTER=http://other:8080 onley replica check` | a cron job pointing elsewhere, without editing the file |
+| `~/.onley/config.json` | `onley config set master http://host:8080` | the normal case |
+
+The first one that is set wins, so `-master ""` is the same as leaving it out.
+`replica check` prints the master it resolved and which of the three it came
+from, because a stale URL in the file is otherwise invisible and the failure
+looks like the master being down.
+
+`config set` refuses a URL with no scheme or no host, and refuses a key it does
+not know, so a typo is caught at the moment it is written instead of at the next
+replica run. A configuration file that cannot be parsed stops the command with
+an error naming the file: it is not treated as empty, because in replica mode
+the consequences of aiming at the wrong master are deletions.
 
 `replica check` queries the master for every file in the local index and builds a plan:
 

@@ -64,6 +64,7 @@ onley watch ~/Downloads
 | `stats` | 显示总文件数和重复文件数 |
 | `serve` | 启动 master HTTP 服务（用于多机模式） |
 | `replica check` | 将本地索引与 master 比对，生成并执行计划 |
+| `config set` / `config show` | 读写按用户保存的设置 |
 
 ## 全局参数
 
@@ -146,12 +147,30 @@ onley -db /data/master.db serve -port 8080 -store /data/files
 | `-port <n>` | `8080` | 监听端口 |
 | `-store <dir>` | `onley-store` | 接收迁移文件的存储目录 |
 
-**在每台 replica 机器上**，先扫描本地文件，再执行比对：
+**在每台 replica 机器上**，先把 master 记下来，再扫描并比对：
 
 ```sh
-onley -db local.db scan /my/files
-onley -db local.db replica check -master http://master-host:8080
+onley config set master http://master-host:8080
+onley scan /my/files
+onley replica check
 ```
+
+`replica check` 必须知道连哪台 master，而这个值每台机器是固定的，所以记在索引旁边的
+`~/.onley/config.json` 里。单次运行仍然可以覆盖：
+
+| 来源 | 示例 | 适用场景 |
+|---|---|---|
+| `-master` | `onley replica check -master http://other:8080` | 临时换一台 master 跑一次 |
+| `ONLEY_MASTER` | `ONLEY_MASTER=http://other:8080 onley replica check` | cron 里指向另一台，不必改文件 |
+| `~/.onley/config.json` | `onley config set master http://host:8080` | 常规用法 |
+
+三者按此顺序取第一个非空值，所以 `-master ""` 与不传等价。`replica check` 会打印
+它最终用的 master 以及来自三者中的哪一个 —— 配置里存了过期 URL 时完全看不出来，失败
+表现会和「master 连不上」混在一起。
+
+`config set` 会拒绝缺 scheme、缺 host 的 URL，也会拒绝它不认识的键，这样打错字在写入
+的那一刻就被拦住，而不是等到下一次 replica 运行时才发现。配置文件无法解析时命令直接
+报错退出并指出文件路径，不会当成空配置 —— 在多机模式下，连错 master 的后果是删文件。
 
 `replica check` 对本地索引中的每个文件查询 master，生成操作计划：
 

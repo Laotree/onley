@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -19,6 +20,7 @@ import (
 
 	"github.com/mattn/go-isatty"
 
+	"onley/internal/config"
 	"onley/internal/db"
 	"onley/internal/replica"
 	"onley/internal/scanner"
@@ -34,6 +36,11 @@ const (
 	// legacyDBFile is the working-directory-relative name the index used to
 	// default to.
 	legacyDBFile = "onley.db"
+	// configFileName is the settings file inside dbDirName.
+	configFileName = "config.json"
+	// masterEnvVar overrides the configured master without touching the file,
+	// which is what a cron job pointing at a different master needs.
+	masterEnvVar = "ONLEY_MASTER"
 )
 
 func main() {
@@ -57,7 +64,8 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "  clean-all            keep first file per group, delete the rest (with confirmation)\n")
 		fmt.Fprintf(stderr, "  stats                show index statistics\n")
 		fmt.Fprintf(stderr, "  serve                start master HTTP server\n")
-		fmt.Fprintf(stderr, "  replica check        compare with master and apply plan\n\n")
+		fmt.Fprintf(stderr, "  replica check        compare with master and apply plan\n")
+		fmt.Fprintf(stderr, "  config <sub>         store or display settings (config set master <url>)\n\n")
 		fmt.Fprintf(stderr, "Options:\n")
 		fs.PrintDefaults()
 	}
@@ -112,6 +120,12 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return cmdCleanAll(*dbPath, stdin, stdout, stderr)
 	case "stats":
 		return cmdStats(*dbPath, stdout, stderr)
+	case "config":
+		if len(rest) < 2 {
+			fmt.Fprintf(stderr, "error: config requires a subcommand, e.g.: config set master <url>\n")
+			return 1
+		}
+		return cmdConfig(rest[1], rest[2:], stdout, stderr)
 	case "serve":
 		return cmdServe(*dbPath, rest[1:], stdout, stderr)
 	case "replica":
@@ -133,7 +147,22 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	}
 }
 
-// rejectExtraDirs refuses arguments a command cannot act on.
+// rejectExtraArgs refuses arguments a command cannot act on.
+func rejectExtraArgs(extra []string) error {
+	if len(extra) == 0 {
+		return nil
+	}
+	quoted := make([]string, len(extra))
+	for i, a := range extra {
+		quoted[i] = strconv.Quote(a)
+	}
+	if len(extra) == 1 {
+		return fmt.Errorf("unexpected argument %s", quoted[0])
+	}
+	return fmt.Errorf("unexpected arguments %s", strings.Join(quoted, ", "))
+}
+
+// rejectExtraDirs refuses directory arguments a command cannot act on.
 //
 // scan and dupes took the first extra argument and dropped the rest without a
 // word, so `onley scan ~/Downloads ~/Documents` reported success having indexed
@@ -204,20 +233,43 @@ func openDB(path string, stderr io.Writer) *db.DB {
 // Falling back to a working-directory path would reintroduce exactly the
 // behaviour this replaces.
 func defaultDBPath(stderr io.Writer) (string, error) {
-	home, err := os.UserHomeDir()
+	dir, err := onleyDir()
 	if err != nil {
-		return "", fmt.Errorf("cannot locate the home directory, pass -db to choose an index: %w", err)
-	}
-	dir := filepath.Join(home, dbDirName)
-	// 0700 because the index lists the paths and digests of the user's files.
-	// The directory is what keeps it private; the file mode inside it does not
-	// have to be restrictive as well.
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return "", fmt.Errorf("cannot create %s: %w", dir, err)
+		return "", fmt.Errorf("%w, pass -db to choose an index", err)
 	}
 	target := filepath.Join(dir, dbFileName)
 	adoptLegacyDB(target, stderr)
 	return target, nil
+}
+
+// onleyDir returns ~/.onley, creating it if it does not exist. The index and
+// the settings share it, so both follow the user instead of the working
+// directory.
+//
+// It is 0700 because the index lists the paths and digests of the user's files.
+// The directory is what keeps that private; the modes on the files inside it do
+// not have to be restrictive as well.
+func onleyDir() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("cannot locate the home directory: %w", err)
+	}
+	dir := filepath.Join(home, dbDirName)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", fmt.Errorf("cannot create %s: %w", dir, err)
+	}
+	return dir, nil
+}
+
+// defaultConfigPath returns ~/.onley/config.json, creating the directory if
+// needed. It is resolved lazily by the commands that read settings, so that a
+// command with nothing to configure does not touch the home directory.
+func defaultConfigPath() (string, error) {
+	dir, err := onleyDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, configFileName), nil
 }
 
 // adoptLegacyDB copies a working-directory onley.db to the new default location
@@ -593,6 +645,118 @@ func truncate(s string, n int) string {
 	return "..." + s[len(s)-n+3:]
 }
 
+// cmdConfig reads and writes the per-user settings.
+func cmdConfig(action string, args []string, stdout, stderr io.Writer) int {
+	path, err := defaultConfigPath()
+	if err != nil {
+		fmt.Fprintf(stderr, "error: %v\n", err)
+		return 1
+	}
+
+	switch action {
+	case "show":
+		return configShow(path, stdout, stderr)
+	case "set":
+		if len(args) < 2 {
+			fmt.Fprintln(stderr, "error: config set requires a key and a value, e.g.: config set master http://host:8080")
+			return 1
+		}
+		if err := rejectExtraArgs(args[2:]); err != nil {
+			fmt.Fprintf(stderr, "error: %v\n", err)
+			return 1
+		}
+		return configSet(path, args[0], args[1], stdout, stderr)
+	default:
+		fmt.Fprintf(stderr, "unknown config subcommand: %s\n", action)
+		return 1
+	}
+}
+
+// configShow prints the settings that are in the file.
+func configShow(path string, stdout, stderr io.Writer) int {
+	cfg, err := config.Load(path)
+	if err != nil {
+		fmt.Fprintf(stderr, "error: %v\n", err)
+		return 1
+	}
+	fmt.Fprintf(stdout, "%s\n", path)
+	if cfg.Master == "" {
+		fmt.Fprintln(stdout, "  master: (not set)")
+	} else {
+		fmt.Fprintf(stdout, "  master: %s\n", cfg.Master)
+	}
+	if v := os.Getenv(masterEnvVar); v != "" {
+		fmt.Fprintf(stdout, "  %s overrides master: %s\n", masterEnvVar, v)
+	}
+	return 0
+}
+
+// configSet writes one setting. Rejecting an unknown key here keeps a typo from
+// being stored in a file that parses cleanly and is then silently ignored.
+func configSet(path, key, value string, stdout, stderr io.Writer) int {
+	if key != "master" {
+		fmt.Fprintf(stderr, "error: unknown setting %q; only \"master\" can be set\n", key)
+		return 1
+	}
+	if err := validateMasterURL(value); err != nil {
+		fmt.Fprintf(stderr, "error: %v\n", err)
+		return 1
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		fmt.Fprintf(stderr, "error: %v\n", err)
+		return 1
+	}
+	cfg.Master = value
+	if err := cfg.Save(path); err != nil {
+		fmt.Fprintf(stderr, "error: %v\n", err)
+		return 1
+	}
+	fmt.Fprintf(stdout, "master = %s\n", value)
+	fmt.Fprintf(stdout, "Written to %s\n", path)
+	return 0
+}
+
+// validateMasterURL catches the mistakes that are worth catching before a URL is
+// stored: a value with no scheme cannot be reached, and one with no host names
+// nothing. The check is local, so setting the value stays fast and offline.
+func validateMasterURL(raw string) error {
+	if raw == "" {
+		return errors.New("master URL must not be empty")
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("master URL %q is not a valid URL: %w", raw, err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("master URL %q needs an http:// or https:// scheme", raw)
+	}
+	if u.Host == "" {
+		return fmt.Errorf("master URL %q has no host", raw)
+	}
+	return nil
+}
+
+// resolveMaster picks the master URL from the flag, the environment and the
+// settings file, in that order, and says which one it used.
+//
+// The flag keeps its empty default, so an omitted flag and an explicitly empty
+// one are the same thing: neither is a value, and both fall through. Printing
+// the source matters because a stale URL in the file is otherwise invisible, and
+// the failure would look like the master being unreachable.
+func resolveMaster(flagValue string, cfg config.Config) (url, source string) {
+	if flagValue != "" {
+		return flagValue, "flag"
+	}
+	if v := os.Getenv(masterEnvVar); v != "" {
+		return v, masterEnvVar
+	}
+	if cfg.Master != "" {
+		return cfg.Master, "config"
+	}
+	return "", ""
+}
+
 func cmdServe(dbPath string, args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 	fs.SetOutput(stderr)
@@ -630,14 +794,28 @@ func cmdReplicaCheck(dbPath string, args []string, stdin io.Reader, stdout, stde
 	if err := fs.Parse(args); err != nil {
 		return 1
 	}
-	if *masterURL == "" {
-		fmt.Fprintln(stderr, "error: -master flag is required")
+
+	cfgPath, err := defaultConfigPath()
+	if err != nil {
+		fmt.Fprintf(stderr, "error: %v\n", err)
 		return 1
 	}
+	cfg, err := config.Load(cfgPath)
+	if err != nil {
+		fmt.Fprintf(stderr, "error: %v\n", err)
+		return 1
+	}
+	master, source := resolveMaster(*masterURL, cfg)
+	if master == "" {
+		fmt.Fprintln(stderr, "error: no master is configured")
+		fmt.Fprintf(stderr, "hint: pass -master <url>, set %s, or run: onley config set master <url>\n", masterEnvVar)
+		return 1
+	}
+	fmt.Fprintf(stdout, "Master: %s (from %s)\n", master, source)
 
-	client := replica.NewClient(*masterURL)
+	client := replica.NewClient(master)
 	if err := client.Ping(); err != nil {
-		fmt.Fprintf(stderr, "cannot reach master %s: %v\n", *masterURL, err)
+		fmt.Fprintf(stderr, "cannot reach master %s: %v\n", master, err)
 		return 1
 	}
 
