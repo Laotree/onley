@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -11,9 +12,12 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/mattn/go-isatty"
 
 	"onley/internal/db"
 	"onley/internal/replica"
@@ -85,6 +89,10 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 			fmt.Fprintln(stderr, "error: scan requires a directory argument")
 			return 1
 		}
+		if err := rejectExtraDirs(rest[2:]); err != nil {
+			fmt.Fprintf(stderr, "error: %v\n", err)
+			return 1
+		}
 		return cmdScan(*dbPath, rest[1], *workers, stdout, stderr)
 	case "watch":
 		if len(rest) < 2 {
@@ -93,6 +101,10 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		}
 		return cmdWatch(*dbPath, rest[1], rest[2:], stdout, stderr)
 	case "dupes":
+		if err := rejectExtraDirs(rest[1:]); err != nil {
+			fmt.Fprintf(stderr, "error: %v\n", err)
+			return 1
+		}
 		return cmdDupes(*dbPath, stdout, stderr)
 	case "clean":
 		return cmdClean(*dbPath, stdin, stdout, stderr)
@@ -119,6 +131,56 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		fs.Usage()
 		return 1
 	}
+}
+
+// rejectExtraDirs refuses arguments a command cannot act on.
+//
+// scan and dupes took the first extra argument and dropped the rest without a
+// word, so `onley scan ~/Downloads ~/Documents` reported success having indexed
+// one directory. Naming the ignored arguments is the whole fix: silently doing
+// part of what was asked is worse than refusing.
+func rejectExtraDirs(extra []string) error {
+	if len(extra) == 0 {
+		return nil
+	}
+	quoted := make([]string, len(extra))
+	for i, a := range extra {
+		quoted[i] = strconv.Quote(a)
+	}
+	if len(extra) == 1 {
+		return fmt.Errorf("unexpected argument %s; this command takes a single directory", quoted[0])
+	}
+	return fmt.Errorf("unexpected arguments %s; this command takes a single directory",
+		strings.Join(quoted, ", "))
+}
+
+// isTerminal reports whether w is a terminal someone is watching.
+//
+// A writer that is not an *os.File, which is every test and anything wrapping a
+// buffer, counts as not interactive. That is the safe direction: skipping the
+// animation costs a progress display, emitting cursor-movement into a buffer or
+// a log corrupts it.
+func isTerminal(w io.Writer) bool {
+	f, ok := w.(*os.File)
+	if !ok {
+		return false
+	}
+	return isatty.IsTerminal(f.Fd()) || isatty.IsCygwinTerminal(f.Fd())
+}
+
+// reportNoInput turns an exhausted input stream into a failure.
+//
+// It is separated from answering no on purpose. An empty stream has not declined
+// anything, and a command that deletes files must not report a decision nobody
+// made. A cron job with nothing on stdin used to get "Cancelled." and exit 0,
+// which reads as a successful run that deliberately left the files alone.
+func reportNoInput(err error, stderr io.Writer) int {
+	if errors.Is(err, ui.ErrNoInput) {
+		fmt.Fprintf(stderr, "error: %v; nothing was deleted\n", err)
+		fmt.Fprintln(stderr, "hint: run this from a terminal, or feed the answer on stdin, e.g. echo y |")
+		return 1
+	}
+	return -1 // not this error; the caller handles it as it sees fit
 }
 
 func openDB(path string, stderr io.Writer) *db.DB {
@@ -223,6 +285,12 @@ func cmdScan(dbPath, dir string, workers int, stdout, stderr io.Writer) int {
 
 	fmt.Fprintf(stdout, "Scanning: %s\n", absDir)
 
+	// The worker block redraws itself with cursor-movement escapes. Those are
+	// only readable on a terminal; redirected to a file or a pipe they turn the
+	// log into a wall of escape codes, so the block is skipped and only the
+	// final summary is written.
+	interactive := isTerminal(stdout)
+
 	// workerFiles[i] = path currently being hashed by worker i; "" = idle.
 	workerFiles := make([]string, workers)
 	var errCount, skippedCount, current int
@@ -230,6 +298,9 @@ func cmdScan(dbPath, dir string, workers int, stdout, stderr io.Writer) int {
 	drawn := false // whether we have already drawn the worker block
 
 	redraw := func() {
+		if !interactive {
+			return
+		}
 		if drawn {
 			// Move cursor up (workers + 1) lines to overwrite the whole block.
 			fmt.Fprintf(stdout, "\033[%dA", workers+1)
@@ -404,13 +475,20 @@ func cmdClean(dbPath string, stdin io.Reader, stdout, stderr io.Writer) int {
 
 	ui.ShowDuplicatesW(groups, stdout)
 	br := bufio.NewReader(stdin)
-	toDelete := ui.CleanInteractive(groups, br)
+	toDelete, err := ui.CleanInteractive(groups, stdout, br)
+	if code := reportNoInput(err, stderr); code >= 0 {
+		return code
+	}
 	if len(toDelete) == 0 {
 		fmt.Fprintln(stdout, "No files selected, exiting.")
 		return 0
 	}
 
-	if !ui.ConfirmDelete(toDelete, br) {
+	confirmed, err := ui.ConfirmDelete(toDelete, stdout, br)
+	if code := reportNoInput(err, stderr); code >= 0 {
+		return code
+	}
+	if !confirmed {
 		fmt.Fprintln(stdout, "Cancelled.")
 		return 0
 	}
@@ -466,7 +544,11 @@ func cmdCleanAll(dbPath string, stdin io.Reader, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stdout)
 	}
 
-	if !ui.ConfirmDelete(toDelete, bufio.NewReader(stdin)) {
+	confirmed, err := ui.ConfirmDelete(toDelete, stdout, bufio.NewReader(stdin))
+	if code := reportNoInput(err, stderr); code >= 0 {
+		return code
+	}
+	if !confirmed {
 		fmt.Fprintln(stdout, "Cancelled.")
 		return 0
 	}
@@ -623,7 +705,14 @@ func cmdReplicaCheck(dbPath string, args []string, stdin io.Reader, stdout, stde
 
 	fmt.Fprintf(stdout, "\nProceed with the above? [y/N] ")
 	br := bufio.NewReader(stdin)
-	line, _ := br.ReadString('\n')
+	line, readErr := br.ReadString('\n')
+	// The plan above ends in deletions, so an input that never arrives has to be
+	// a failure rather than a quiet "no".
+	if readErr != nil && strings.TrimSpace(line) == "" {
+		if code := reportNoInput(ui.ErrNoInput, stderr); code >= 0 {
+			return code
+		}
+	}
 	if strings.TrimSpace(strings.ToLower(line)) != "y" {
 		fmt.Fprintln(stdout, "Cancelled.")
 		return 0

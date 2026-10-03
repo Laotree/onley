@@ -1244,3 +1244,251 @@ func TestDefaultDBPath_NoArgumentsCreatesNothing(t *testing.T) {
 		t.Error("printing usage created the default directory")
 	}
 }
+
+// --- argument, output and input handling ---
+
+// TestRun_ScanRejectsSecondDirectory is the silent-data-loss case: scan used to
+// take the first directory, drop the rest and report success.
+func TestRun_ScanRejectsSecondDirectory(t *testing.T) {
+	first := t.TempDir()
+	second := t.TempDir()
+	dbFile := filepath.Join(t.TempDir(), "test.db")
+
+	_, stderr, code := runCmd("-db", dbFile, "scan", first, second)
+	if code == 0 {
+		t.Error("scan accepted two directories and reported success")
+	}
+	if !strings.Contains(stderr, second) {
+		t.Errorf("the error should name the ignored directory %q; got: %s", second, stderr)
+	}
+}
+
+// TestRun_ScanSingleDirectoryStillWorks keeps the rejection from firing on the
+// normal case.
+func TestRun_ScanSingleDirectoryStillWorks(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "f.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	dbFile := filepath.Join(t.TempDir(), "test.db")
+
+	stdout, stderr, code := runCmd("-db", dbFile, "scan", dir)
+	if code != 0 {
+		t.Fatalf("scan failed: %d, stderr: %s", code, stderr)
+	}
+	if !strings.Contains(stdout, "Done: 1 file(s) indexed") {
+		t.Errorf("unexpected output: %s", stdout)
+	}
+}
+
+func TestRun_ScanRejectsManyExtraDirectories(t *testing.T) {
+	dir := t.TempDir()
+	dbFile := filepath.Join(t.TempDir(), "test.db")
+	extra := []string{dir + "-a", dir + "-b", dir + "-c"}
+
+	_, stderr, code := runCmd(append([]string{"-db", dbFile, "scan", dir}, extra...)...)
+	if code == 0 {
+		t.Error("scan accepted extra directories")
+	}
+	for _, e := range extra {
+		if !strings.Contains(stderr, e) {
+			t.Errorf("the error should name %q; got: %s", e, stderr)
+		}
+	}
+}
+
+func TestRun_DupesRejectsExtraArgument(t *testing.T) {
+	dbFile := filepath.Join(t.TempDir(), "test.db")
+	_, stderr, code := runCmd("-db", dbFile, "dupes", "/some/dir")
+	if code == 0 {
+		t.Error("dupes accepted a directory argument")
+	}
+	if !strings.Contains(stderr, "/some/dir") {
+		t.Errorf("the error should name the argument; got: %s", stderr)
+	}
+}
+
+// TestScan_NoEscapeCodesWhenRedirected covers a log file full of cursor-movement
+// escapes: the progress block was emitted whether or not anyone could read it.
+func TestScan_NoEscapeCodesWhenRedirected(t *testing.T) {
+	if _, err := exec.LookPath(binaryPath); err != nil {
+		t.Skipf("binary not built: %v", err)
+	}
+	dir := t.TempDir()
+	dbFile := filepath.Join(t.TempDir(), "test.db")
+	for i := 0; i < 4; i++ {
+		if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("f%d.txt", i)), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	logPath := filepath.Join(t.TempDir(), "scan.log")
+	logFile, err := os.Create(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(binaryPath, "-db", dbFile, "scan", dir)
+	cmd.Stdout = logFile
+	cmd.Stderr = logFile
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("scan failed: %v", err)
+	}
+	logFile.Close()
+
+	content, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(content), "\033") {
+		t.Errorf("redirected scan output contains escape sequences:\n%q", content)
+	}
+	if !strings.Contains(string(content), "Done: 4 file(s) indexed") {
+		t.Errorf("redirected scan lost its summary:\n%s", content)
+	}
+}
+
+// TestIsTerminal_NonFileWriterIsNotInteractive covers the rule that keeps tests
+// and buffers out of the animated path.
+func TestIsTerminal_NonFileWriterIsNotInteractive(t *testing.T) {
+	if isTerminal(&bytes.Buffer{}) {
+		t.Error("a buffer is not a terminal")
+	}
+	if isTerminal(nil) {
+		t.Error("a nil writer is not a terminal")
+	}
+}
+
+// TestClean_PromptsFollowRedirectedOutput is the defect where the prompts were
+// written straight to os.Stdout and vanished from the caller's own output.
+func TestClean_PromptsFollowRedirectedOutput(t *testing.T) {
+	dir := t.TempDir()
+	dbFile := filepath.Join(t.TempDir(), "test.db")
+	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("same"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "b.txt"), []byte("same"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, code := runCmd("-db", dbFile, "scan", dir); code != 0 {
+		t.Fatal("scan failed")
+	}
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	// Keep both duplicates: "1" keeps the first, so b.txt is selected for
+	// deletion, then decline the confirmation.
+	code := run([]string{"-db", dbFile, "clean"}, strings.NewReader("1\nn\n"), &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("clean exited %d: %s", code, stderr.String())
+	}
+	for _, want := range []string{"Keep number(s)", "Confirm deletion?"} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Errorf("prompt %q missing from the caller's output:\n%s", want, stdout.String())
+		}
+	}
+}
+
+// TestClean_ExhaustedStdinFails is the cron case: nothing to read on stdin used
+// to print "Cancelled." and exit 0, which reads as a run that chose to keep
+// every file.
+func TestClean_ExhaustedStdinFails(t *testing.T) {
+	dir := t.TempDir()
+	dbFile := filepath.Join(t.TempDir(), "test.db")
+	for _, name := range []string{"a.txt", "b.txt"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("same"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, _, code := runCmd("-db", dbFile, "scan", dir); code != 0 {
+		t.Fatal("scan failed")
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"-db", dbFile, "clean"}, strings.NewReader(""), &stdout, &stderr)
+	if code == 0 {
+		t.Errorf("clean exited 0 with nothing on stdin; stderr: %s", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "input ended") {
+		t.Errorf("stderr should explain the exhausted input: %s", stderr.String())
+	}
+	// The files must still be there: a failed confirmation is not a licence to
+	// delete.
+	for _, name := range []string{"a.txt", "b.txt"} {
+		if _, err := os.Stat(filepath.Join(dir, name)); err != nil {
+			t.Errorf("%s was deleted despite the failed confirmation: %v", name, err)
+		}
+	}
+}
+
+func TestCleanAll_ExhaustedStdinFails(t *testing.T) {
+	dir := t.TempDir()
+	dbFile := filepath.Join(t.TempDir(), "test.db")
+	for _, name := range []string{"a.txt", "b.txt"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("same"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, _, code := runCmd("-db", dbFile, "scan", dir); code != 0 {
+		t.Fatal("scan failed")
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"-db", dbFile, "clean-all"}, strings.NewReader(""), &stdout, &stderr)
+	if code == 0 {
+		t.Errorf("clean-all exited 0 with nothing on stdin; stderr: %s", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "input ended") {
+		t.Errorf("stderr should explain the exhausted input: %s", stderr.String())
+	}
+	kept, _, _ := runCmd("-db", dbFile, "stats")
+	if !strings.Contains(kept, "Total indexed: 2") {
+		t.Errorf("files were removed despite the failed confirmation: %s", kept)
+	}
+}
+
+// TestClean_DeclinedStillSucceeds keeps an explicit "n" a success: declining is
+// the user exercising control, not a failure.
+func TestClean_DeclinedStillSucceeds(t *testing.T) {
+	dir := t.TempDir()
+	dbFile := filepath.Join(t.TempDir(), "test.db")
+	for _, name := range []string{"a.txt", "b.txt"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("same"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, _, code := runCmd("-db", dbFile, "scan", dir); code != 0 {
+		t.Fatal("scan failed")
+	}
+
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"-db", dbFile, "clean"}, strings.NewReader("1\nn\n"), &stdout, &stderr); code != 0 {
+		t.Errorf("declining the deletion exited %d; stderr: %s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "Cancelled.") {
+		t.Errorf("declining should be reported: %s", stdout.String())
+	}
+}
+
+// TestCleanAll_PipedYesStillDeletes keeps `echo y |` working: the fix separates
+// an exhausted stream from an answer, it does not reject pipes.
+func TestCleanAll_PipedYesStillDeletes(t *testing.T) {
+	dir := t.TempDir()
+	dbFile := filepath.Join(t.TempDir(), "test.db")
+	for _, name := range []string{"a.txt", "b.txt"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("same"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, _, code := runCmd("-db", dbFile, "scan", dir); code != 0 {
+		t.Fatal("scan failed")
+	}
+
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"-db", dbFile, "clean-all"}, strings.NewReader("y\n"), &stdout, &stderr); code != 0 {
+		t.Fatalf("clean-all exited %d: %s", code, stderr.String())
+	}
+	kept, _, _ := runCmd("-db", dbFile, "stats")
+	if !strings.Contains(kept, "Total indexed: 1") {
+		t.Errorf("the piped confirmation did not take effect: %s", kept)
+	}
+}

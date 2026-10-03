@@ -2,14 +2,20 @@ package ui
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"io"
-	"os"
 	"strconv"
 	"strings"
 
 	"onley/internal/db"
 )
+
+// ErrNoInput reports that the input ended before the question was answered.
+// It is deliberately distinct from answering no: an empty stream cannot decline,
+// it simply has nothing to say, and a command that deletes files must not treat
+// the two the same.
+var ErrNoInput = errors.New("input ended before the question was answered")
 
 func formatSize(bytes int64) string {
 	const unit = 1024
@@ -40,37 +46,51 @@ func ShowDuplicatesW(groups []db.DuplicateGroup, w io.Writer) {
 	}
 }
 
-// ShowDuplicates prints all duplicate groups to os.Stdout.
-func ShowDuplicates(groups []db.DuplicateGroup) {
-	ShowDuplicatesW(groups, os.Stdout)
+// readAnswer reads one line of input. The bool is false when the stream ended
+// without an answer, which is ErrNoInput rather than a declined question.
+//
+// A final line without a trailing newline still counts as an answer: a here-doc
+// or a pipe that writes "1" and closes has answered, it has not gone silent.
+func readAnswer(r *bufio.Reader) (string, bool) {
+	line, err := r.ReadString('\n')
+	if err != nil && strings.TrimSpace(line) == "" {
+		return "", false
+	}
+	return strings.TrimSpace(line), true
 }
 
 // CleanInteractive lets the user pick which duplicates to delete for each group.
 // It returns the paths the user chose to delete (not yet deleted from disk).
-// r must be a shared bufio.Reader so that ConfirmDelete can read from the same stream.
-func CleanInteractive(groups []db.DuplicateGroup, r *bufio.Reader) []string {
+// r must be a shared bufio.Reader so that ConfirmDelete can read from the same
+// stream.
+//
+// It returns ErrNoInput when the input ends before every group has been offered,
+// so the caller can tell an incomplete run from a deliberate one.
+func CleanInteractive(groups []db.DuplicateGroup, w io.Writer, r *bufio.Reader) ([]string, error) {
 	if len(groups) == 0 {
-		return nil
+		return nil, nil
 	}
 
 	var toDelete []string
 
-	fmt.Println("For each group, enter the number(s) to KEEP (others will be deleted).")
-	fmt.Println("Press Enter to skip a group.")
-	fmt.Println()
+	fmt.Fprintln(w, "For each group, enter the number(s) to KEEP (others will be deleted).")
+	fmt.Fprintln(w, "Press Enter to skip a group.")
+	fmt.Fprintln(w)
 
 	for i, g := range groups {
-		fmt.Printf("── Group %d  MD5: %s  size: %s ──\n", i+1, g.MD5, formatSize(g.Size))
+		fmt.Fprintf(w, "── Group %d  MD5: %s  size: %s ──\n", i+1, g.MD5, formatSize(g.Size))
 		for j, f := range g.Files {
-			fmt.Printf("  [%d] %s\n", j+1, f.Path)
+			fmt.Fprintf(w, "  [%d] %s\n", j+1, f.Path)
 		}
-		fmt.Print("Keep number(s) (e.g. 1 or 1,2; Enter to skip): ")
+		fmt.Fprint(w, "Keep number(s) (e.g. 1 or 1,2; Enter to skip): ")
 
-		line, _ := r.ReadString('\n')
-		line = strings.TrimSpace(line)
+		line, ok := readAnswer(r)
+		if !ok {
+			return toDelete, ErrNoInput
+		}
 		if line == "" {
-			fmt.Println("Skipped.")
-			fmt.Println()
+			fmt.Fprintln(w, "Skipped.")
+			fmt.Fprintln(w)
 			continue
 		}
 
@@ -78,14 +98,14 @@ func CleanInteractive(groups []db.DuplicateGroup, r *bufio.Reader) []string {
 		for _, part := range strings.Split(line, ",") {
 			n, err := strconv.Atoi(strings.TrimSpace(part))
 			if err != nil || n < 1 || n > len(g.Files) {
-				fmt.Printf("  Invalid number %q, skipping group.\n", part)
+				fmt.Fprintf(w, "  Invalid number %q, skipping group.\n", part)
 				keepSet = nil
 				break
 			}
 			keepSet[n] = true
 		}
 		if keepSet == nil {
-			fmt.Println()
+			fmt.Fprintln(w)
 			continue
 		}
 
@@ -94,24 +114,31 @@ func CleanInteractive(groups []db.DuplicateGroup, r *bufio.Reader) []string {
 				toDelete = append(toDelete, f.Path)
 			}
 		}
-		fmt.Println()
+		fmt.Fprintln(w)
 	}
 
-	return toDelete
+	return toDelete, nil
 }
 
 // ConfirmDelete shows the files to be deleted and asks for confirmation.
 // r must be the same shared bufio.Reader used by CleanInteractive.
-func ConfirmDelete(paths []string, r *bufio.Reader) bool {
+//
+// It returns ErrNoInput when the input ends before the question is answered, so
+// that a run with nothing to read on stdin fails instead of reporting that it
+// declined to delete.
+func ConfirmDelete(paths []string, w io.Writer, r *bufio.Reader) (bool, error) {
 	if len(paths) == 0 {
-		return false
+		return false, nil
 	}
-	fmt.Printf("The following %d file(s) will be permanently deleted:\n", len(paths))
+	fmt.Fprintf(w, "The following %d file(s) will be permanently deleted:\n", len(paths))
 	for _, p := range paths {
-		fmt.Printf("  - %s\n", p)
+		fmt.Fprintf(w, "  - %s\n", p)
 	}
-	fmt.Print("Confirm deletion? (y/N): ")
+	fmt.Fprint(w, "Confirm deletion? (y/N): ")
 
-	line, _ := r.ReadString('\n')
-	return strings.TrimSpace(strings.ToLower(line)) == "y"
+	line, ok := readAnswer(r)
+	if !ok {
+		return false, ErrNoInput
+	}
+	return strings.EqualFold(line, "y"), nil
 }

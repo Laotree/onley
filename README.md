@@ -60,7 +60,7 @@ onley watch ~/Downloads
 | `watch <dir>` | Keep the index current as files under `dir` change |
 | `dupes` | List all duplicate groups |
 | `clean` | Interactive: choose which files to keep per group |
-| `clean-all` | Non-interactive: keep the first file per group, delete the rest |
+| `clean-all` | Keep the first file per group and delete the rest, after one confirmation |
 | `stats` | Print total files and duplicate count |
 | `serve` | Start master HTTP server (for replica mode) |
 | `replica check` | Compare local index against a master, apply plan |
@@ -125,7 +125,13 @@ Other commands can run against the same index while `watch` is running. Stop it 
 Keep number(s) (e.g. 1 or 1,2; Enter to skip): 1
 ```
 
-`clean-all` is non-interactive: it keeps the alphabetically first path in each group and deletes the rest after a single confirmation.
+`clean-all` keeps the alphabetically first path in each group and deletes the rest after a single confirmation. It is not unattended: it asks once, and running it from a cron job with nothing on stdin fails rather than quietly keeping every file. Feed it an answer to script it:
+
+```sh
+echo y | onley clean-all
+```
+
+`clean` and `clean-all` treat an exhausted stdin differently from a declined one. An empty stream has not declined anything, so the run fails and deletes nothing; answering `n` is a decision, and succeeds.
 
 ## Replica mode
 

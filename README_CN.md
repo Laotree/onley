@@ -60,7 +60,7 @@ onley watch ~/Downloads
 | `watch <dir>` | 随 `dir` 下文件的变化持续维护索引 |
 | `dupes` | 列出所有重复文件组 |
 | `clean` | 交互式：逐组选择要保留的文件 |
-| `clean-all` | 非交互式：每组保留第一个文件，删除其余（需一次确认） |
+| `clean-all` | 每组保留第一个文件、删除其余（需一次确认） |
 | `stats` | 显示总文件数和重复文件数 |
 | `serve` | 启动 master HTTP 服务（用于多机模式） |
 | `replica check` | 将本地索引与 master 比对，生成并执行计划 |
@@ -123,7 +123,13 @@ onley watch -debounce 2s /Volumes/data
 Keep number(s) (e.g. 1 or 1,2; Enter to skip): 1
 ```
 
-`clean-all` 为非交互模式：每组按路径字母顺序保留第一个文件，一次确认后删除其余文件。
+`clean-all` 每组按路径字母顺序保留第一个文件，一次确认后删除其余文件。它不是无人值守命令：它会问一次，在 cron 里 stdin 为空时直接失败，而不是悄悄地把所有文件都留着。需要脚本化就喂一个答案：
+
+```sh
+echo y | onley clean-all
+```
+
+`clean` 与 `clean-all` 会区分「stdin 读到 EOF」和「明确答 n」。空输入流并没有拒绝任何东西，所以这种情况判为失败且不删除任何文件；答 `n` 是一个决定，视为成功。
 
 ## 多机模式（Replica）
 
