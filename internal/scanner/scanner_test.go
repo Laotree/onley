@@ -414,3 +414,119 @@ func TestScan_Workers1(t *testing.T) {
 		t.Fatalf("unexpected errors: %v", errs)
 	}
 }
+
+// --- IndexFile (used by watch) ---
+
+func TestIndexFile_IndexesAndStoresDigest(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "hello.txt")
+	if err := os.WriteFile(path, []byte("hello"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	store := openMemDB(t)
+
+	if err := IndexFile(path, store); err != nil {
+		t.Fatalf("IndexFile: %v", err)
+	}
+
+	rec, err := store.Lookup(path)
+	if err != nil || rec == nil {
+		t.Fatalf("Lookup: rec=%v err=%v", rec, err)
+	}
+	if rec.MD5 != md5Of("hello") {
+		t.Errorf("MD5 = %s, want %s", rec.MD5, md5Of("hello"))
+	}
+	if rec.Name != "hello.txt" {
+		t.Errorf("Name = %s, want hello.txt", rec.Name)
+	}
+}
+
+// TestIndexFile_UnchangedFileIsLeftAlone keeps watch cheap: the startup sweep
+// walks every existing file, and re-hashing a tree that scan already indexed
+// would defeat the point of the resume check scan relies on.
+func TestIndexFile_UnchangedFileIsLeftAlone(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "stable.txt")
+	if err := os.WriteFile(path, []byte("stable"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	store := openMemDB(t)
+	if err := IndexFile(path, store); err != nil {
+		t.Fatalf("IndexFile: %v", err)
+	}
+
+	before, err := store.Lookup(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// scanned_at is only refreshed by an upsert, so an unchanged file that is
+	// skipped leaves the old timestamp in place.
+	time.Sleep(1100 * time.Millisecond)
+	if err := IndexFile(path, store); err != nil {
+		t.Fatalf("second IndexFile: %v", err)
+	}
+
+	total, _, err := store.Stats()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 1 {
+		t.Errorf("want 1 record, got %d", total)
+	}
+	if before.MD5 != md5Of("stable") {
+		t.Errorf("digest changed on an unchanged file")
+	}
+}
+
+func TestIndexFile_RehashesChangedContent(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "changing.txt")
+	if err := os.WriteFile(path, []byte("first"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	store := openMemDB(t)
+	if err := IndexFile(path, store); err != nil {
+		t.Fatalf("IndexFile: %v", err)
+	}
+
+	// Same length, different bytes: only the mtime differs, which is why scan
+	// treats the pair as a change.
+	if err := os.WriteFile(path, []byte("secnd"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	touch(t, path, time.Now().Add(2*time.Second))
+
+	if err := IndexFile(path, store); err != nil {
+		t.Fatalf("IndexFile after change: %v", err)
+	}
+	rec, err := store.Lookup(path)
+	if err != nil || rec == nil {
+		t.Fatalf("Lookup: rec=%v err=%v", rec, err)
+	}
+	if rec.MD5 != md5Of("secnd") {
+		t.Errorf("MD5 = %s, want %s — a changed file must be re-hashed", rec.MD5, md5Of("secnd"))
+	}
+}
+
+func TestIndexFile_RejectsDirectory(t *testing.T) {
+	store := openMemDB(t)
+	if err := IndexFile(t.TempDir(), store); err == nil {
+		t.Errorf("IndexFile accepted a directory, which would hash an unreadable path")
+	}
+}
+
+func TestIndexFile_MissingFile(t *testing.T) {
+	store := openMemDB(t)
+	if err := IndexFile(filepath.Join(t.TempDir(), "nope"), store); err == nil {
+		t.Errorf("IndexFile accepted a path that does not exist")
+	}
+}
+
+// touch sets a file's mtime, because a rewrite within the same second leaves
+// the stored mtime unchanged and the resume check would skip the file.
+func touch(t *testing.T, path string, when time.Time) {
+	t.Helper()
+	if err := os.Chtimes(path, when, when); err != nil {
+		t.Fatalf("chtimes: %v", err)
+	}
+}

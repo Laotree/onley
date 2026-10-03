@@ -45,12 +45,15 @@ func Open(path string) (*DB, error) {
 	// Single connection: SQLite doesn't benefit from a pool, and in-memory
 	// databases require a single connection so all goroutines share the same db.
 	conn.SetMaxOpenConns(1)
+	// The pragmas come first. journal_mode=WAL and the schema both need a write
+	// lock, so a second process opening the same database while a long-running
+	// command such as watch holds it open would fail without a busy timeout.
+	conn.Exec("PRAGMA busy_timeout=5000")
+	conn.Exec("PRAGMA journal_mode=WAL")
 	if _, err := conn.Exec(schema); err != nil {
 		conn.Close()
 		return nil, fmt.Errorf("init schema: %w", err)
 	}
-	conn.Exec("PRAGMA journal_mode=WAL")
-	conn.Exec("PRAGMA busy_timeout=5000")
 	// Best-effort migration; ignore error when column already exists.
 	conn.Exec(migration)
 	return &DB{conn: conn}, nil

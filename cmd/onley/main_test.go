@@ -2,12 +2,14 @@ package main
 
 import (
 	"bytes"
+	"fmt"
 	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"onley/internal/db"
 	"onley/internal/replica"
@@ -702,6 +704,236 @@ func TestRun_ServeBadStoreDir(t *testing.T) {
 	if code == 0 {
 		t.Log("MkdirAll succeeded unexpectedly; skipping assertion")
 	}
+}
+
+// --- watch ---
+
+func TestRun_WatchMissingDirArg(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"watch"}, &bytes.Buffer{}, &stdout, &stderr); code != 1 {
+		t.Errorf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "requires a directory") {
+		t.Errorf("stderr should explain the missing argument; got: %s", stderr.String())
+	}
+}
+
+func TestRun_WatchNonExistentDir(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"watch", filepath.Join(t.TempDir(), "nope")}, &bytes.Buffer{}, &stdout, &stderr)
+	if code != 1 {
+		t.Errorf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "directory not found") {
+		t.Errorf("stderr should report the missing directory; got: %s", stderr.String())
+	}
+}
+
+func TestRun_WatchFileInsteadOfDir(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "f.txt")
+	if err := os.WriteFile(path, []byte("hi"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"watch", path}, &bytes.Buffer{}, &stdout, &stderr)
+	if code != 1 {
+		t.Errorf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "not a directory") {
+		t.Errorf("stderr should reject a file argument; got: %s", stderr.String())
+	}
+}
+
+// TestRun_WatchBadFlag covers the flag set of the subcommand itself.
+func TestRun_WatchBadFlag(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"watch", t.TempDir(), "-nope"}, &bytes.Buffer{}, &stdout, &stderr)
+	if code != 1 {
+		t.Errorf("exit code = %d, want 1", code)
+	}
+}
+
+// TestRun_WatchUsageListsSubcommand keeps the new command discoverable from the
+// top-level help.
+func TestRun_WatchUsageListsSubcommand(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	run(nil, &bytes.Buffer{}, &stdout, &stderr)
+	if !strings.Contains(stderr.String(), "watch <dir>") {
+		t.Errorf("usage should list watch; got: %s", stderr.String())
+	}
+}
+
+// TestWatch_IndexesThenRemoves is the end-to-end path: watch maintains the index
+// as files appear and disappear, and never touches the file system itself.
+//
+// watch runs until interrupted, so the binary is driven as a subprocess and
+// stopped with a signal, which is also what an operator does.
+func TestWatch_IndexesThenRemoves(t *testing.T) {
+	if _, err := exec.LookPath(binaryPath); err != nil {
+		t.Skipf("binary not built: %v", err)
+	}
+	dir := t.TempDir()
+	dbFile := filepath.Join(t.TempDir(), "watch.db")
+	added := filepath.Join(dir, "added.txt")
+	doomed := filepath.Join(dir, "doomed.txt")
+	if err := os.WriteFile(added, []byte("kept"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(doomed, []byte("removed later"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := exec.Command(binaryPath, "-db", dbFile, "watch", dir, "-debounce", "80ms")
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &out
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start watch: %v", err)
+	}
+	defer func() {
+		cmd.Process.Signal(os.Interrupt)
+		cmd.Wait()
+	}()
+
+	waitForIndex(t, dbFile, 2, "both starting files", &out)
+
+	// A new file must land in the index.
+	late := filepath.Join(dir, "late.txt")
+	if err := os.WriteFile(late, []byte("arrived later"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	waitForIndex(t, dbFile, 3, "the file added while watching", &out)
+
+	// A deleted file must leave the index, and the deletion must be the user's
+	// own: watch only drops the record.
+	if err := os.Remove(doomed); err != nil {
+		t.Fatal(err)
+	}
+	waitForIndex(t, dbFile, 2, "the deleted file to leave the index", &out)
+
+	if _, err := os.Stat(late); err != nil {
+		t.Errorf("watch removed a file from disk: %v", err)
+	}
+}
+
+// TestWatch_StopReportsTotals covers the shutdown path: interrupting must leave
+// a consistent index and print what it did.
+func TestWatch_StopReportsTotals(t *testing.T) {
+	if _, err := exec.LookPath(binaryPath); err != nil {
+		t.Skipf("binary not built: %v", err)
+	}
+	dir := t.TempDir()
+	dbFile := filepath.Join(t.TempDir(), "watch.db")
+	if err := os.WriteFile(filepath.Join(dir, "one.txt"), []byte("one"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := exec.Command(binaryPath, "-db", dbFile, "watch", dir, "-debounce", "80ms")
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &out
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start watch: %v", err)
+	}
+	waitForIndex(t, dbFile, 1, "the starting file", &out)
+
+	cmd.Process.Signal(os.Interrupt)
+	if err := cmd.Wait(); err != nil {
+		t.Errorf("watch exited with %v; output: %s", err, out.String())
+	}
+	if !strings.Contains(out.String(), "Stopped:") {
+		t.Errorf("watch should report totals on exit; got: %s", out.String())
+	}
+}
+
+// TestConcurrentCommandsDuringWatch runs other onley commands against the index
+// while watch holds it open. Every command opens the database, and the schema
+// needs a write lock to be a no-op, so without a busy timeout set before it a
+// reader racing a watch write fails with SQLITE_BUSY.
+//
+// This is a separate process rather than a second db.DB in this one, because
+// the failure needs the real cross-process file locking that a shared in-process
+// connection does not reproduce.
+func TestConcurrentCommandsDuringWatch(t *testing.T) {
+	if _, err := exec.LookPath(binaryPath); err != nil {
+		t.Skipf("binary not built: %v", err)
+	}
+	dir := t.TempDir()
+	dbFile := filepath.Join(t.TempDir(), "watch.db")
+	// Several files so watch keeps writing while the readers run.
+	for i := 0; i < 5; i++ {
+		if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("f%d.bin", i)), make([]byte, 4096), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	cmd := exec.Command(binaryPath, "-db", dbFile, "watch", dir, "-debounce", "60ms")
+	var watchOut bytes.Buffer
+	cmd.Stdout = &watchOut
+	cmd.Stderr = &watchOut
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start watch: %v", err)
+	}
+	defer func() {
+		cmd.Process.Signal(os.Interrupt)
+		cmd.Wait()
+	}()
+
+	waitForIndex(t, dbFile, 5, "the starting files", &watchOut)
+
+	// Keep touching files so watch is writing throughout, then hammer the same
+	// database with read-only commands.
+	stop := make(chan struct{})
+	go func() {
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			os.WriteFile(filepath.Join(dir, fmt.Sprintf("churn%d.bin", i%3)), make([]byte, 1024), 0o644)
+			time.Sleep(20 * time.Millisecond)
+		}
+	}()
+	defer close(stop)
+
+	for _, args := range [][]string{
+		{"stats"},
+		{"dupes"},
+	} {
+		for i := 0; i < 20; i++ {
+			out, err := exec.Command(binaryPath, append([]string{"-db", dbFile}, args...)...).CombinedOutput()
+			if err != nil {
+				t.Fatalf("%v while watch is writing (attempt %d): %v\n%s", args, i, err, out)
+			}
+			if strings.Contains(string(out), "locked") {
+				t.Fatalf("%v hit a lock error: %s", args, out)
+			}
+		}
+	}
+}
+
+// waitForIndex polls stats until the index holds want files. watchOut is
+// reported on failure, because "the index is empty" is only diagnosable
+// together with what watch itself printed.
+func waitForIndex(t *testing.T, dbFile string, want int, what string, watchOut *bytes.Buffer) {
+	t.Helper()
+	deadline := time.Now().Add(15 * time.Second)
+	var last string
+	for time.Now().Before(deadline) {
+		out, err := exec.Command(binaryPath, "-db", dbFile, "stats").Output()
+		if err == nil {
+			last = string(out)
+			var total int
+			fmt.Sscanf(strings.TrimSpace(strings.SplitN(last, "\n", 2)[0]), "Total indexed: %d", &total)
+			if total == want {
+				return
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s (want %d); stats said: %s\nwatch printed:\n%s", what, want, last, watchOut.String())
 }
 
 func TestBinary_SmokeStats(t *testing.T) {

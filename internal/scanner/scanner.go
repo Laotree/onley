@@ -85,12 +85,12 @@ func Scan(root string, store *db.DB, workers int) <-chan Progress {
 			go func() {
 				defer wg.Done()
 				for j := range jobs {
-					existing, err := store.Lookup(j.path)
+					unchanged, err := storeUnchanged(store, j.path, j.size, j.mtime)
 					if err != nil {
 						results <- result{path: j.path, workerID: id, err: err}
 						continue
 					}
-					if existing != nil && existing.Size == j.size && existing.Mtime == j.mtime {
+					if unchanged {
 						results <- result{path: j.path, workerID: id, skipped: true}
 						continue
 					}
@@ -155,6 +155,48 @@ func Scan(root string, store *db.DB, workers int) <-chan Progress {
 	}()
 
 	return ch
+}
+
+// IndexFile indexes one regular file, or does nothing when the stored record
+// already matches its size and mtime. A file whose size or mtime differs from
+// the stored record is re-hashed and upserted, so callers must only pass files
+// that have stopped changing: a partially written file hashes to a digest that
+// no longer matches its content once the write completes.
+func IndexFile(path string, store *db.DB) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("not a regular file: %s", path)
+	}
+	size, mtime := info.Size(), info.ModTime().Unix()
+	if unchanged, err := storeUnchanged(store, path, size, mtime); err != nil {
+		return err
+	} else if unchanged {
+		return nil
+	}
+	hash, err := hashFile(path)
+	if err != nil {
+		return err
+	}
+	return store.Upsert(db.FileRecord{
+		Path:  path,
+		Name:  filepath.Base(path),
+		Size:  size,
+		MD5:   hash,
+		Mtime: mtime,
+	})
+}
+
+// storeUnchanged reports whether path already has a record with the given size
+// and mtime, which means its content cannot have changed since it was indexed.
+func storeUnchanged(store *db.DB, path string, size, mtime int64) (bool, error) {
+	existing, err := store.Lookup(path)
+	if err != nil {
+		return false, err
+	}
+	return existing != nil && existing.Size == size && existing.Mtime == mtime, nil
 }
 
 func hashFile(path string) (string, error) {
