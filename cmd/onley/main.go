@@ -867,37 +867,46 @@ func cmdReplicaCheck(dbPath string, assumeYes bool, args []string, stdin io.Read
 	}
 	defer store.Close()
 
-	files, err := store.AllFiles()
+	// One question per digest, not per file. The master's answer depends only on
+	// the content, so every file sharing a digest was asking the same thing.
+	groups, err := store.MD5Groups()
 	if err != nil {
 		fmt.Fprintf(stderr, "failed to read local index: %v\n", err)
 		return 1
 	}
-	if len(files) == 0 {
+	if len(groups) == 0 {
 		fmt.Fprintln(stdout, "Local index is empty; run scan first.")
 		return 0
 	}
 
-	fmt.Fprintf(stdout, "Comparing %d file(s) with master...\n", len(files))
+	fileCount := 0
+	for _, g := range groups {
+		fileCount += len(g.Files)
+	}
+	fmt.Fprintf(stdout, "Comparing %d file(s) in %d distinct digest(s) with master...\n", fileCount, len(groups))
 
 	var toDelete, toMigrate []replica.PlanEntry
 	var queryFailed int
 
-	for i, f := range files {
-		found, err := client.Check(f.MD5)
+	for i, g := range groups {
+		found, err := client.Check(g.MD5)
 		if err != nil {
-			fmt.Fprintf(stderr, "  query failed %s: %v\n", f.Path, err)
-			queryFailed++
+			// Every file in the group is unaccounted for, not just one of them.
+			fmt.Fprintf(stderr, "  query failed for %d file(s) with digest %s: %v\n", len(g.Files), g.MD5, err)
+			queryFailed += len(g.Files)
 			continue
 		}
-		entry := replica.PlanEntry{Path: f.Path, MD5: f.MD5, Size: f.Size}
-		if found {
-			entry.Action = replica.ActionDeleteLocal
-			toDelete = append(toDelete, entry)
-		} else {
-			entry.Action = replica.ActionMigrate
-			toMigrate = append(toMigrate, entry)
+		for _, f := range g.Files {
+			entry := replica.PlanEntry{Path: f.Path, MD5: f.MD5, Size: f.Size}
+			if found {
+				entry.Action = replica.ActionDeleteLocal
+				toDelete = append(toDelete, entry)
+			} else {
+				entry.Action = replica.ActionMigrate
+				toMigrate = append(toMigrate, entry)
+			}
 		}
-		fmt.Fprintf(stdout, "\r  progress: %d/%d", i+1, len(files))
+		fmt.Fprintf(stdout, "\r  progress: %d/%d", i+1, len(groups))
 	}
 	fmt.Fprintln(stdout)
 

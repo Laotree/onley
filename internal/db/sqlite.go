@@ -155,6 +155,44 @@ func (d *DB) AllFiles() ([]FileRecord, error) {
 	return records, rows.Err()
 }
 
+// MD5Group is one digest and every file that shares it.
+type MD5Group struct {
+	MD5   string
+	Size  int64
+	Files []FileRecord
+}
+
+// MD5Groups returns every distinct digest in the index together with the files
+// that carry it, ordered by digest.
+//
+// Asking a master "do you have this content" once per digest rather than once
+// per file is the difference between 50 requests and 2000 for an index of that
+// shape: the answer depends only on the digest, so every file sharing one is
+// asking the same question. idx_files_md5 already exists for this.
+func (d *DB) MD5Groups() ([]MD5Group, error) {
+	rows, err := d.conn.Query(
+		`SELECT id, path, name, size, md5, mtime FROM files ORDER BY md5, path`,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var groups []MD5Group
+	for rows.Next() {
+		var r FileRecord
+		if err := rows.Scan(&r.ID, &r.Path, &r.Name, &r.Size, &r.MD5, &r.Mtime); err != nil {
+			return nil, err
+		}
+		if len(groups) == 0 || groups[len(groups)-1].MD5 != r.MD5 {
+			groups = append(groups, MD5Group{MD5: r.MD5, Size: r.Size})
+		}
+		g := &groups[len(groups)-1]
+		g.Files = append(g.Files, r)
+	}
+	return groups, rows.Err()
+}
+
 // FindByMD5 returns all files whose MD5 matches the given hash.
 func (d *DB) FindByMD5(md5 string) ([]FileRecord, error) {
 	rows, err := d.conn.Query(

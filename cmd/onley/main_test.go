@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"crypto/md5"
 	"fmt"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1992,4 +1994,167 @@ func md5OfFile(t *testing.T, path string) string {
 		t.Fatal(err)
 	}
 	return fmt.Sprintf("%x", md5.Sum(data))
+}
+
+// --- one question per digest ---
+
+// countingMaster wraps the real handler and counts the checks asked of it.
+type countingMaster struct {
+	inner http.Handler
+	mu    sync.Mutex
+	seen  map[string]int
+}
+
+func newCountingMaster(t *testing.T) (*httptest.Server, *db.DB, *countingMaster) {
+	t.Helper()
+	store, err := db.Open(":memory:")
+	if err != nil {
+		t.Fatalf("master db.Open: %v", err)
+	}
+	t.Cleanup(func() { store.Close() })
+	dir := t.TempDir()
+	inner := replica.NewServer(store, dir).Handler()
+	c := &countingMaster{inner: inner, seen: map[string]int{}}
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/check" {
+			c.mu.Lock()
+			c.seen[r.URL.Query().Get("md5")]++
+			c.mu.Unlock()
+		}
+		c.inner.ServeHTTP(w, r)
+	}))
+	t.Cleanup(ts.Close)
+	return ts, store, c
+}
+
+func (c *countingMaster) checks() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.seen)
+}
+
+func (c *countingMaster) repeats() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	n := 0
+	for _, v := range c.seen {
+		if v > 1 {
+			n++
+		}
+	}
+	return n
+}
+
+// TestReplicaCheck_AsksOncePerDigest is the whole point: an index where several
+// files share content must not ask the master the same question once per file.
+func TestReplicaCheck_AsksOncePerDigest(t *testing.T) {
+	ts, _, counter := newCountingMaster(t)
+
+	dir := t.TempDir()
+	dbFile := filepath.Join(t.TempDir(), "local.db")
+	// Four files, two distinct contents.
+	for name, content := range map[string]string{
+		"a.txt": "same\n", "b.txt": "same\n", "c.txt": "different\n", "d.txt": "same\n",
+	} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, _, code := runCmd("-db", dbFile, "scan", dir); code != 0 {
+		t.Fatal("scan failed")
+	}
+
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"-db", dbFile, "replica", "check", "-master", ts.URL},
+		strings.NewReader("n\n"), &stdout, &stderr); code != 0 {
+		t.Fatalf("replica check exited %d: %s", code, stderr.String())
+	}
+	if got := counter.checks(); got != 2 {
+		t.Errorf("the master was asked about %d digest(s), want 2 for 4 files with 2 contents", got)
+	}
+	if n := counter.repeats(); n != 0 {
+		t.Errorf("%d digest(s) were asked about more than once", n)
+	}
+	if !strings.Contains(stdout.String(), "4 file(s) in 2 distinct digest(s)") {
+		t.Errorf("the summary should report both counts: %s", stdout.String())
+	}
+}
+
+// TestReplicaCheck_GroupedVerdictAppliesToEveryFile checks the plan did not
+// change: files sharing a digest get the same action, all of them.
+func TestReplicaCheck_GroupedVerdictAppliesToEveryFile(t *testing.T) {
+	ts, _, _ := newCountingMaster(t)
+
+	dir := t.TempDir()
+	dbFile := filepath.Join(t.TempDir(), "local.db")
+	// Put one copy of the shared content on the master first.
+	shared := filepath.Join(t.TempDir(), "seed")
+	if err := os.WriteFile(shared, []byte("same\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sum := md5OfFile(t, shared)
+	if err := replica.NewClient(ts.URL).Ingest(shared, sum); err != nil {
+		t.Fatalf("seeding the master: %v", err)
+	}
+
+	for _, name := range []string{"a.txt", "b.txt", "c.txt"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("same\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, _, code := runCmd("-db", dbFile, "scan", dir); code != 0 {
+		t.Fatal("scan failed")
+	}
+
+	var stdout, stderr bytes.Buffer
+	// Confirm, so all three are deleted.
+	if code := run([]string{"-db", dbFile, "replica", "check", "-master", ts.URL},
+		strings.NewReader("y\n"), &stdout, &stderr); code != 0 {
+		t.Fatalf("replica check exited %d: %s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "3 deleted") {
+		t.Errorf("every file sharing the digest should be deleted: %s", stdout.String())
+	}
+	for _, name := range []string{"a.txt", "b.txt", "c.txt"} {
+		if _, err := os.Stat(filepath.Join(dir, name)); err == nil {
+			t.Errorf("%s survived", name)
+		}
+	}
+}
+
+// TestReplicaCheck_QueryFailureSkipsTheWholeGroup: an unanswered digest leaves
+// every file under it unaccounted for, so the count of skipped files has to
+// match the group, not one arbitrary member.
+func TestReplicaCheck_QueryFailureSkipsTheWholeGroup(t *testing.T) {
+	// Healthy, but every check fails, so the run reaches the comparison and the
+	// error path is what is under test rather than the reachability check.
+	bad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/check" {
+			http.Error(w, "boom", http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer bad.Close()
+
+	dir := t.TempDir()
+	dbFile := filepath.Join(t.TempDir(), "local.db")
+	for _, name := range []string{"a.txt", "b.txt", "c.txt"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("same\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, _, code := runCmd("-db", dbFile, "scan", dir); code != 0 {
+		t.Fatal("scan failed")
+	}
+
+	var stdout, stderr bytes.Buffer
+	run([]string{"-db", dbFile, "replica", "check", "-master", bad.URL}, strings.NewReader(""), &stdout, &stderr)
+
+	if !strings.Contains(stderr.String(), "3 file(s) with digest") {
+		t.Errorf("the failure should account for every file in the group: %s", stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "3 file(s) skipped due to query errors") {
+		t.Errorf("the skipped count should be the group size: %s", stdout.String())
+	}
 }

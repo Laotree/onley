@@ -1,6 +1,8 @@
 package db
 
 import (
+	"fmt"
+	"path/filepath"
 	"testing"
 )
 
@@ -350,5 +352,88 @@ func TestDuplicates_ClosedDB(t *testing.T) {
 	_, err := store.Duplicates()
 	if err == nil {
 		t.Error("expected error from Duplicates on closed connection")
+	}
+}
+
+// --- MD5Groups ---
+
+// TestMD5Groups_GroupsEveryFileUnderItsDigest is what lets the master be asked
+// once per distinct content instead of once per file.
+func TestMD5Groups_GroupsEveryFileUnderItsDigest(t *testing.T) {
+	store := openMemDB(t)
+	add := func(path, sum string) {
+		if err := store.Upsert(FileRecord{Path: path, Name: path, Size: 1, MD5: sum}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	add("/a.txt", "aaa")
+	add("/b.txt", "bbb")
+	add("/c.txt", "aaa") // same content as a.txt
+	add("/d.txt", "aaa")
+
+	groups, err := store.MD5Groups()
+	if err != nil {
+		t.Fatalf("MD5Groups: %v", err)
+	}
+	if len(groups) != 2 {
+		t.Fatalf("got %d groups, want 2 distinct digests", len(groups))
+	}
+	// Ordered by digest, so the shape is predictable.
+	if groups[0].MD5 != "aaa" || len(groups[0].Files) != 3 {
+		t.Errorf("group aaa = %d file(s), want 3", len(groups[0].Files))
+	}
+	if groups[1].MD5 != "bbb" || len(groups[1].Files) != 1 {
+		t.Errorf("group bbb = %d file(s), want 1", len(groups[1].Files))
+	}
+	// Within a group the paths are ordered, which keeps the plan stable.
+	if groups[0].Files[0].Path != "/a.txt" || groups[0].Files[2].Path != "/d.txt" {
+		t.Errorf("group aaa is not ordered by path: %v", groups[0].Files)
+	}
+}
+
+func TestMD5Groups_Empty(t *testing.T) {
+	groups, err := openMemDB(t).MD5Groups()
+	if err != nil {
+		t.Fatalf("MD5Groups: %v", err)
+	}
+	if len(groups) != 0 {
+		t.Errorf("got %d groups from an empty index, want 0", len(groups))
+	}
+}
+
+// TestMD5Groups_CoversEveryFile guards the invariant the grouping relies on: no
+// file may go missing between AllFiles and the groups.
+func TestMD5Groups_CoversEveryFile(t *testing.T) {
+	store := openMemDB(t)
+	sums := []string{"a", "b", "c", "a", "d", "b", "a"}
+	for i, sum := range sums {
+		path := filepath.Join("/tmp", fmt.Sprintf("f%d", i))
+		if err := store.Upsert(FileRecord{Path: path, Name: path, Size: int64(i), MD5: sum}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	groups, err := store.MD5Groups()
+	if err != nil {
+		t.Fatalf("MD5Groups: %v", err)
+	}
+	seen := map[string]bool{}
+	for _, g := range groups {
+		for _, f := range g.Files {
+			if seen[f.Path] {
+				t.Errorf("%s appears in more than one group", f.Path)
+			}
+			seen[f.Path] = true
+		}
+	}
+	if len(seen) != len(sums) {
+		t.Errorf("groups cover %d file(s), want %d", len(seen), len(sums))
+	}
+}
+
+func TestMD5Groups_ClosedDB(t *testing.T) {
+	store := openMemDB(t)
+	store.Close()
+	if _, err := store.MD5Groups(); err == nil {
+		t.Error("expected an error from MD5Groups on a closed connection")
 	}
 }
