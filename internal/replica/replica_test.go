@@ -29,13 +29,20 @@ func openMemDB(t *testing.T) *db.DB {
 }
 
 func newTestServer(t *testing.T) (*Server, *httptest.Server, *db.DB) {
+	srv, ts, store, _ := newTestServerWithStore(t)
+	return srv, ts, store
+}
+
+// newTestServerWithStore also returns the store directory, for the tests that
+// need to assert on what was left on disk.
+func newTestServerWithStore(t *testing.T) (*Server, *httptest.Server, *db.DB, string) {
 	t.Helper()
 	store := openMemDB(t)
 	storeDir := t.TempDir()
 	srv := NewServer(store, storeDir)
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(ts.Close)
-	return srv, ts, store
+	return srv, ts, store, storeDir
 }
 
 // --- Server unit tests ---
@@ -121,7 +128,10 @@ func TestServer_IngestStoresFile(t *testing.T) {
 	if err := os.WriteFile(localPath, []byte("hello replica"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	const md5sum = "aabbccdd00112233445566778899aabb"
+	// The digest of what was actually written, not a plausible-looking constant.
+	// The master verifies this now, and it did not before, which is why a
+	// fabricated value used to pass unnoticed.
+	md5sum := md5OfFile(t, localPath)
 
 	// Not on master yet.
 	found, err := client.Check(md5sum)
@@ -147,6 +157,18 @@ func TestServer_IngestStoresFile(t *testing.T) {
 	if err != nil || len(records) == 0 {
 		t.Errorf("expected record in master DB; got %d records, err=%v", len(records), err)
 	}
+}
+
+// md5OfFile returns the digest of path's contents. Tests that upload something
+// have to declare the digest the master will verify against, and computing it is
+// the only way to declare the right one.
+func md5OfFile(t *testing.T, path string) string {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	return fmt.Sprintf("%x", md5.Sum(data))
 }
 
 // --- Client unit tests ---
@@ -375,4 +397,228 @@ func newFailingIngestServer(t *testing.T) (*httptest.Server, func()) {
 		w.WriteHeader(http.StatusInternalServerError)
 	}))
 	return srv, srv.Close
+}
+
+// --- digest verification ---
+
+// TestServer_IngestRejectsMismatchedMD5 is the case that was possible before this
+// change: content stored under a digest it does not have, indexed as though it
+// did. Check then tells every other replica this content is backed up here.
+func TestServer_IngestRejectsMismatchedMD5(t *testing.T) {
+	_, ts, store, storeDir := newTestServerWithStore(t)
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "real.txt")
+	if err := os.WriteFile(path, []byte("THE REAL CONTENT"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	const claimed = "0000000000000000000000000000dead"
+
+	err := NewClient(ts.URL).Ingest(path, claimed)
+	if err == nil {
+		t.Fatal("Ingest accepted a file whose digest does not match")
+	}
+	if !strings.Contains(err.Error(), "md5 mismatch") {
+		t.Errorf("the error should say the digest did not match; got: %v", err)
+	}
+
+	// Nothing may be left under the claimed address: a file whose content does not
+	// match its location is worse than an absent one, because the next replica
+	// to ask about this digest would find it.
+	assertNoFiles(t, storeDir)
+	files, err := store.FindByMD5(claimed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(files) != 0 {
+		t.Errorf("the master indexed %d record(s) for the claimed digest", len(files))
+	}
+}
+
+// TestServer_IngestMismatchLeavesOtherFilesAlone makes sure the cleanup removes
+// the rejected upload and not the store.
+func TestServer_IngestMismatchLeavesOtherFilesAlone(t *testing.T) {
+	_, ts, _ := newTestServer(t)
+	client := NewClient(ts.URL)
+
+	dir := t.TempDir()
+	good := filepath.Join(dir, "good.txt")
+	if err := os.WriteFile(good, []byte("good content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Ingest(good, md5OfFile(t, good)); err != nil {
+		t.Fatalf("the honest upload failed: %v", err)
+	}
+
+	bad := filepath.Join(dir, "bad.txt")
+	if err := os.WriteFile(bad, []byte("different content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Ingest(bad, md5OfFile(t, good)); err == nil {
+		t.Fatal("the mismatched upload was accepted")
+	}
+
+	found, err := client.Check(md5OfFile(t, good))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found {
+		t.Error("the earlier honest upload was removed along with the rejected one")
+	}
+}
+
+// TestServer_IngestAcceptsMatchingMD5 is the ordinary path, stated so the check
+// cannot be tightened into rejecting valid uploads.
+func TestServer_IngestAcceptsMatchingMD5(t *testing.T) {
+	_, ts, store := newTestServer(t)
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "fine.txt")
+	content := []byte("content that matches its digest")
+	if err := os.WriteFile(path, content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sum := md5OfFile(t, path)
+
+	if err := NewClient(ts.URL).Ingest(path, sum); err != nil {
+		t.Fatalf("a matching digest was rejected: %v", err)
+	}
+	records, err := store.FindByMD5(sum)
+	if err != nil || len(records) != 1 {
+		t.Fatalf("want 1 record, got %d (err=%v)", len(records), err)
+	}
+	got, err := os.ReadFile(records[0].Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, content) {
+		t.Error("the stored bytes are not what was sent")
+	}
+}
+
+// TestServer_IngestRejectsMalformedMD5 covers the format check that replaced the
+// old length test. The store layout is derived from this value, so the format
+// matters as well as the length.
+func TestServer_IngestRejectsMalformedMD5(t *testing.T) {
+	_, ts, _, storeDir := newTestServerWithStore(t)
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "f.txt")
+	if err := os.WriteFile(path, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, bad := range []string{
+		"",
+		"ab",
+		"aabbccdd00112233445566778899aab",   // 31
+		"aabbccdd00112233445566778899aabbc", // 33
+		"gabbccdd00112233445566778899aabb",  // not hex
+		"../../etc/passwd00000000000000000", // not hex, and looks like a path
+	} {
+		if err := NewClient(ts.URL).Ingest(path, bad); err == nil {
+			t.Errorf("the master accepted md5 %q", bad)
+		}
+	}
+	assertStoreUntouched(t, storeDir)
+}
+
+// assertNoFiles fails if the store directory holds any file.
+//
+// Used for an upload rejected for a content mismatch. Its address was
+// legitimate, and the directories it created are shared with every other file of
+// the same digest, so what must not survive is the file.
+func assertNoFiles(t *testing.T, storeDir string) {
+	t.Helper()
+	var found []string
+	err := filepath.Walk(storeDir, func(p string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() {
+			found = append(found, p)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk store: %v", err)
+	}
+	if len(found) != 0 {
+		t.Errorf("the store still holds %d file(s): %v", len(found), found)
+	}
+}
+
+// assertStoreUntouched fails if anything at all is left under the store,
+// directories included.
+//
+// Used for a request rejected on its format, where even an empty directory is
+// residue: those are what a traversal attempt leaves behind when the address was
+// never validated.
+func assertStoreUntouched(t *testing.T, storeDir string) {
+	t.Helper()
+	var found []string
+	err := filepath.Walk(storeDir, func(p string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if p != storeDir {
+			found = append(found, p)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk store: %v", err)
+	}
+	if len(found) != 0 {
+		t.Errorf("the store still holds %d entr(ies): %v", len(found), found)
+	}
+}
+
+// TestServer_IngestRejectsPathTraversalInMD5 covers the reason the digest is
+// format-checked rather than merely length-checked. The md5 is split into
+// directory levels for the content-addressed layout, so a value carrying "../"
+// escaped the store entirely:
+//
+//	{"ok":true,"path":"/tmp/outside-the-store/payload.txt"}
+//
+// Any client that can reach /v1/ingest could write wherever the master's process
+// can. A length check does not stop it: the payload is longer than four
+// characters.
+func TestServer_IngestRejectsPathTraversalInMD5(t *testing.T) {
+	_, ts, _, storeDir := newTestServerWithStore(t)
+
+	dir := t.TempDir()
+	payload := filepath.Join(dir, "payload.txt")
+	if err := os.WriteFile(payload, []byte("content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Aim the traversal at a directory this test owns and can write to, so a
+	// successful escape is observable rather than hidden behind a permission
+	// error on some parent of the temp tree.
+	victim := t.TempDir()
+	rel, err := filepath.Rel(storeDir, victim)
+	if err != nil {
+		t.Fatalf("rel: %v", err)
+	}
+	traversal := filepath.Join(rel, "escaped")
+	want := filepath.Join(victim, "escaped")
+
+	// The handler splits the value after two characters and joins the halves, so
+	// this is where the upload would land. Deriving it the same way keeps the
+	// assertion pointed at the real destination.
+	got := filepath.Join(storeDir, traversal[:2], traversal[2:])
+	if got != want {
+		t.Fatalf("test arithmetic: escape target is %s, wanted %s", got, want)
+	}
+
+	if err := NewClient(ts.URL).Ingest(payload, traversal); err == nil {
+		t.Fatal("the master accepted an md5 containing a path traversal")
+	}
+	if _, err := os.Stat(want); err == nil {
+		t.Errorf("the upload escaped the store: %s was created", want)
+	}
+	// Nothing under the store either: a request rejected on its format must not
+	// have touched the filesystem at all.
+	assertStoreUntouched(t, storeDir)
 }

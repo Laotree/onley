@@ -1,7 +1,9 @@
 package replica
 
 import (
+	"crypto/md5"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -55,6 +57,23 @@ func writeJSON(w http.ResponseWriter, v any) {
 	json.NewEncoder(w).Encode(v)
 }
 
+// isMD5Hex reports whether s is a 32 character lowercase hex digest.
+//
+// Lowercase only, because the value becomes a directory name: accepting "AB" as
+// well as "ab" would put one digest in two places.
+func isMD5Hex(s string) bool {
+	if len(s) != 32 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]bool{"ok": true})
 }
@@ -95,8 +114,11 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 	defer file.Close()
 
 	md5sum := r.FormValue("md5")
-	if len(md5sum) < 4 {
-		http.Error(w, "missing or invalid md5", http.StatusBadRequest)
+	if !isMD5Hex(md5sum) {
+		// The store layout is derived from this value, and the comparison below
+		// is only meaningful against a real digest, so the format is checked
+		// rather than merely the length.
+		http.Error(w, "missing or invalid md5: want 32 lowercase hex characters, as produced by the replica", http.StatusBadRequest)
 		return
 	}
 
@@ -115,9 +137,36 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 	}
 	defer out.Close()
 
-	size, err := io.Copy(out, file)
+	// Hash what actually arrived rather than believing the md5 field. The two can
+	// disagree without anybody lying: the replica hashes a file, the file changes,
+	// and the upload sends the new bytes under the old digest.
+	//
+	// The consequence of not checking is not a misplaced file. Check answers
+	// "do you have this digest" from the index, so storing content under a digest
+	// it does not have tells every other replica that this content is backed up
+	// here, and they delete their copy. It would be backed up nowhere.
+	hasher := md5.New()
+	size, err := io.Copy(io.MultiWriter(out, hasher), file)
 	if err != nil {
+		out.Close()
+		os.Remove(destPath)
 		http.Error(w, "write: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	// Close before reading back, so the bytes are on disk before anything can
+	// observe them.
+	if err := out.Close(); err != nil {
+		os.Remove(destPath)
+		http.Error(w, "write: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	if got := fmt.Sprintf("%x", hasher.Sum(nil)); got != md5sum {
+		// Leave nothing behind. A file whose content does not match its address
+		// is worse than an absent one: the next replica to ask about this digest
+		// finds it.
+		os.Remove(destPath)
+		http.Error(w, fmt.Sprintf("md5 mismatch: the upload declares %s but hashes to %s, so it is not the file the replica indexed", md5sum, got), http.StatusBadRequest)
 		return
 	}
 
@@ -129,6 +178,7 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 		Mtime: 0,
 	}
 	if err := s.store.Upsert(rec); err != nil {
+		os.Remove(destPath)
 		http.Error(w, "index: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
