@@ -2,8 +2,10 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/md5"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -2361,4 +2363,51 @@ func TestWatchSync_IndexingIsNotBlockedBySlowUploads(t *testing.T) {
 	}
 	t.Fatalf("indexing waited on the uploads: %d of 3 indexed in 1.2s\nwatch said:\n%s",
 		strings.Count(out.String(), "indexed"), out.String())
+}
+
+// TestRunSyncLoop_BacksOffAfterAFailedRound covers the loop's use of the
+// backoff, which the syncer's own tests cannot see: they call NextInterval
+// directly and a loop that asks for the wait at the top of every iteration
+// resets what the previous round earned.
+//
+// This was found by running against two machines and counting the log lines a
+// dead master produced, not by reading the code. With the wait recomputed each
+// iteration, a 2s interval and a master that was down produced eight identical
+// warnings in twenty seconds.
+func TestRunSyncLoop_BacksOffAfterAFailedRound(t *testing.T) {
+	// A 20ms interval doubles to 40, 80, 160, 320, 640ms. Rounds therefore land
+	// at about 20, 60, 140, 300 and 620ms: five in a second. Without the backoff
+	// it is fifty.
+	syncer := replica.NewSyncer(replica.NewClient("http://127.0.0.1:1"), 20*time.Millisecond)
+	path := filepath.Join(t.TempDir(), "f.bin")
+	if err := os.WriteFile(path, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sum := fmt.Sprintf("%x", md5.Sum([]byte("x")))
+	syncer.Enqueue(sum, path)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	errs := &syncBuffer{}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		runSyncLoop(ctx, syncer, io.Discard, errs)
+	}()
+
+	time.Sleep(time.Second)
+	cancel()
+	<-done
+
+	rounds := strings.Count(errs.String(), "could not be pushed")
+	if rounds == 0 {
+		t.Fatalf("the loop never tried to push:\n%s", errs.String())
+	}
+	if rounds > 10 {
+		t.Errorf("got %d failed rounds in 1s with a 20ms interval; the wait is not backing off\n%s",
+			rounds, errs.String())
+	}
+	if syncer.Pending() != 1 {
+		t.Errorf("Pending = %d, want the path still queued for a retry", syncer.Pending())
+	}
 }
