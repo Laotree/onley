@@ -604,8 +604,12 @@ func watchSyncer(flagValue string, interval time.Duration, stdout, stderr io.Wri
 // interval for hours, and the wait returns to normal as soon as one round
 // succeeds.
 func runSyncLoop(ctx context.Context, syncer *replica.Syncer, stdout, stderr io.Writer) {
+	// The wait is carried across iterations rather than asked for at the top of
+	// each one. Asking again resets the backoff the previous round earned, so a
+	// master that is down is probed every interval and reports itself every
+	// interval — which is the thing the backoff exists to stop.
+	wait := syncer.NextInterval(true)
 	for {
-		wait := syncer.NextInterval(true)
 		select {
 		case <-ctx.Done():
 			return
@@ -623,7 +627,7 @@ func runSyncLoop(ctx context.Context, syncer *replica.Syncer, stdout, stderr io.
 		if res.Failed > 0 {
 			fmt.Fprintf(stderr, "  %d file(s) could not be pushed; they will be retried\n", res.Failed)
 		}
-		syncer.NextInterval(res.OK())
+		wait = syncer.NextInterval(res.OK())
 	}
 }
 
