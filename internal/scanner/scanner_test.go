@@ -425,7 +425,7 @@ func TestIndexFile_IndexesAndStoresDigest(t *testing.T) {
 	}
 	store := openMemDB(t)
 
-	if err := IndexFile(path, store); err != nil {
+	if _, err := IndexFile(path, store); err != nil {
 		t.Fatalf("IndexFile: %v", err)
 	}
 
@@ -451,7 +451,7 @@ func TestIndexFile_UnchangedFileIsLeftAlone(t *testing.T) {
 		t.Fatal(err)
 	}
 	store := openMemDB(t)
-	if err := IndexFile(path, store); err != nil {
+	if _, err := IndexFile(path, store); err != nil {
 		t.Fatalf("IndexFile: %v", err)
 	}
 
@@ -462,7 +462,7 @@ func TestIndexFile_UnchangedFileIsLeftAlone(t *testing.T) {
 	// scanned_at is only refreshed by an upsert, so an unchanged file that is
 	// skipped leaves the old timestamp in place.
 	time.Sleep(1100 * time.Millisecond)
-	if err := IndexFile(path, store); err != nil {
+	if _, err := IndexFile(path, store); err != nil {
 		t.Fatalf("second IndexFile: %v", err)
 	}
 
@@ -485,7 +485,7 @@ func TestIndexFile_RehashesChangedContent(t *testing.T) {
 		t.Fatal(err)
 	}
 	store := openMemDB(t)
-	if err := IndexFile(path, store); err != nil {
+	if _, err := IndexFile(path, store); err != nil {
 		t.Fatalf("IndexFile: %v", err)
 	}
 
@@ -496,7 +496,7 @@ func TestIndexFile_RehashesChangedContent(t *testing.T) {
 	}
 	touch(t, path, time.Now().Add(2*time.Second))
 
-	if err := IndexFile(path, store); err != nil {
+	if _, err := IndexFile(path, store); err != nil {
 		t.Fatalf("IndexFile after change: %v", err)
 	}
 	rec, err := store.Lookup(path)
@@ -510,14 +510,14 @@ func TestIndexFile_RehashesChangedContent(t *testing.T) {
 
 func TestIndexFile_RejectsDirectory(t *testing.T) {
 	store := openMemDB(t)
-	if err := IndexFile(t.TempDir(), store); err == nil {
+	if _, err := IndexFile(t.TempDir(), store); err == nil {
 		t.Errorf("IndexFile accepted a directory, which would hash an unreadable path")
 	}
 }
 
 func TestIndexFile_MissingFile(t *testing.T) {
 	store := openMemDB(t)
-	if err := IndexFile(filepath.Join(t.TempDir(), "nope"), store); err == nil {
+	if _, err := IndexFile(filepath.Join(t.TempDir(), "nope"), store); err == nil {
 		t.Errorf("IndexFile accepted a path that does not exist")
 	}
 }

@@ -162,25 +162,30 @@ func Scan(root string, store *db.DB, workers int) <-chan Progress {
 // the stored record is re-hashed and upserted, so callers must only pass files
 // that have stopped changing: a partially written file hashes to a digest that
 // no longer matches its content once the write completes.
-func IndexFile(path string, store *db.DB) error {
+//
+// It returns the digest it wrote, or an empty string when the file was
+// unchanged and nothing was stored. A caller that needs the digest should take
+// it from here rather than hash the file again: the bytes have already been
+// read once.
+func IndexFile(path string, store *db.DB) (string, error) {
 	info, err := os.Stat(path)
 	if err != nil {
-		return err
+		return "", err
 	}
 	if !info.Mode().IsRegular() {
-		return fmt.Errorf("not a regular file: %s", path)
+		return "", fmt.Errorf("not a regular file: %s", path)
 	}
 	size, mtime := info.Size(), info.ModTime().Unix()
 	if unchanged, err := storeUnchanged(store, path, size, mtime); err != nil {
-		return err
+		return "", err
 	} else if unchanged {
-		return nil
+		return "", nil
 	}
 	hash, err := hashFile(path)
 	if err != nil {
-		return err
+		return "", err
 	}
-	return store.Upsert(db.FileRecord{
+	return hash, store.Upsert(db.FileRecord{
 		Path:  path,
 		Name:  filepath.Base(path),
 		Size:  size,
