@@ -129,6 +129,8 @@ onley watch -debounce 2s /Volumes/data
 | Flag | Default | Description |
 |---|---|---|
 | `-debounce <dur>` | `500ms` | How long a file must stop changing before it is indexed |
+| `-master <url>` | none | Push new files to this master; without it, only the index is maintained |
+| `-interval <dur>` | `30s` | How often to push queued files |
 
 It covers the whole directory tree, the same way `scan` does, and it indexes the files that are already there on startup. New subdirectories are picked up as they appear.
 
@@ -137,6 +139,41 @@ It covers the whole directory tree, the same way `scan` does, and it indexes the
 A file is indexed once it stops changing for `-debounce`, and its size and modification time are checked again when the window closes, so a file that grows while the watcher waits is not hashed mid-write. Raise `-debounce` if your files are written in bursts with long pauses: a writer that pauses for longer than the window looks like a writer that finished.
 
 Other commands can run against the same index while `watch` is running. Stop it with Ctrl-C.
+
+### Pushing to a master
+
+Given a `-master`, `watch` also uploads what it indexes:
+
+```sh
+onley watch -master http://master-host:8080 ~/Downloads
+```
+
+**It uploads and never deletes.** Every new file takes the migrate path in
+`replica check`, which uploads and then removes the local copy — so a syncing
+watcher would empty the directory it was told to watch. The local copies stay
+here, and `replica check` remains the place where a deletion is proposed and
+confirmed.
+
+Be clear about what that costs: the master holds a copy **and** the local copy
+stays, so disk use goes up rather than down. This is a push, not the
+consolidation that gives `replica check` its purpose. If you want the space back,
+run `replica check` deliberately.
+
+How it behaves:
+
+- The queue is whatever has been indexed since the last round. On startup that is
+  the whole existing tree, because the startup sweep reports it — so the first
+  round is the reconcile that catches what a previous run missed.
+- Files sharing content are one question and one upload, not one each.
+- A file the master already holds is not uploaded again, and not deleted.
+- A round that fails doubles the wait before the next, up to sixteen times the
+  interval, and a successful round puts it back. A master that is down for a week
+  is not probed every 30 seconds.
+- A master that cannot be reached does not stop the indexing.
+
+Uploads run on their own goroutine. They have to: the watcher's event channel is
+bounded and drops events when it fills, so an upload running in the indexing loop
+would cost index entries silently rather than merely slow down.
 
 ## Clean
 

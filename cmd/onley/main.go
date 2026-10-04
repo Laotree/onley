@@ -445,6 +445,8 @@ func cmdWatch(dbPath, dir string, args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("watch", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	debounce := fs.Duration("debounce", watcher.DefaultDebounce, "how long a file must stop changing before it is indexed")
+	interval := fs.Duration("interval", replica.DefaultSyncInterval, "how often to push new files to the master")
+	masterURL := fs.String("master", "", "master address; new files are uploaded to it (default: from ~/"+dbDirName+"/"+configFileName+")")
 	if err := fs.Parse(args); err != nil {
 		return 1
 	}
@@ -486,6 +488,31 @@ func cmdWatch(dbPath, dir string, args []string, stdout, stderr io.Writer) int {
 
 	fmt.Fprintf(stdout, "Watching %s (debounce %s). Press Ctrl-C to stop.\n", absDir, *debounce)
 
+	// A master is optional. Without one this stays what it was: a process that
+	// keeps the index current and touches nothing else.
+	syncer, master, err := watchSyncer(*masterURL, *interval, stdout, stderr)
+	if err != nil {
+		return 1
+	}
+	if syncer == nil {
+		fmt.Fprintln(stdout, "No master configured; indexing only.")
+	} else {
+		fmt.Fprintf(stdout, "Uploading new files to %s every %s. Nothing is deleted from this machine.\n", master, *interval)
+	}
+
+	var syncDone chan struct{}
+	if syncer != nil {
+		// The uploads run on their own goroutine. Running them in this loop
+		// would leave nobody draining the watcher's events, and that channel has
+		// a bounded buffer: it drops events rather than blocking, so a slow
+		// upload would silently cost index entries.
+		syncDone = make(chan struct{})
+		go func() {
+			defer close(syncDone)
+			runSyncLoop(ctx, syncer, stdout, stderr)
+		}()
+	}
+
 	var indexed, removed, failed int
 	for ev := range w.Events() {
 		if ev.Err != nil {
@@ -506,13 +533,30 @@ func cmdWatch(dbPath, dir string, args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintf(stdout, "  removed  %s\n", ev.Path)
 			continue
 		}
-		if err := scanner.IndexFile(ev.Path, store); err != nil {
+		sum, err := scanner.IndexFile(ev.Path, store)
+		if err != nil {
 			fmt.Fprintf(stderr, "  index failed %s: %v\n", ev.Path, err)
 			failed++
 			continue
 		}
+		if syncer != nil && sum != "" {
+			// The digest is the one just computed while indexing. An unchanged
+			// file returns nothing and needs nothing: it is already on the master
+			// or was never queued.
+			syncer.Enqueue(sum, ev.Path)
+		}
 		indexed++
 		fmt.Fprintf(stdout, "  indexed  %s\n", ev.Path)
+	}
+
+	if syncer != nil {
+		// Let the last round finish so its counters are in the summary rather
+		// than lost, but do not wait on a hung upload.
+		select {
+		case <-syncDone:
+		case <-time.After(10 * time.Second):
+			fmt.Fprintln(stderr, "warning: the final upload round did not finish in time")
+		}
 	}
 
 	// Report what the run did, so a long watch that is stopped from another
@@ -525,6 +569,62 @@ func cmdWatch(dbPath, dir string, args []string, stdout, stderr io.Writer) int {
 	fmt.Fprintf(stdout, "\nStopped: %d indexed, %d removed, %d failed. Index holds %d file(s), %d with duplicates.\n",
 		indexed, removed, failed, total, dups)
 	return 0
+}
+
+// watchSyncer builds a syncer for the resolved master, or returns nil when none
+// is configured.
+//
+// Resolution mirrors `replica check`, flag then environment then the settings
+// file, and the source is printed: a stale URL in the file otherwise shows up as
+// a master that appears to be down.
+func watchSyncer(flagValue string, interval time.Duration, stdout, stderr io.Writer) (*replica.Syncer, string, error) {
+	cfgPath, err := defaultConfigPath()
+	if err != nil {
+		fmt.Fprintf(stderr, "error: %v\n", err)
+		return nil, "", err
+	}
+	cfg, err := config.Load(cfgPath)
+	if err != nil {
+		// A broken settings file stops the command rather than quietly becoming
+		// an index-only watcher, which would look like the master was ignored.
+		fmt.Fprintf(stderr, "error: %v\n", err)
+		return nil, "", err
+	}
+	master, source := resolveMaster(flagValue, cfg)
+	if master == "" {
+		return nil, "", nil
+	}
+	fmt.Fprintf(stdout, "Master: %s (from %s)\n", master, source)
+	return replica.NewSyncer(replica.NewClient(master), interval), master, nil
+}
+
+// runSyncLoop drains the syncer on its schedule until ctx is cancelled.
+//
+// A failed round doubles the wait, so a master that is down is not probed every
+// interval for hours, and the wait returns to normal as soon as one round
+// succeeds.
+func runSyncLoop(ctx context.Context, syncer *replica.Syncer, stdout, stderr io.Writer) {
+	for {
+		wait := syncer.NextInterval(true)
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(wait):
+		}
+
+		if syncer.Pending() == 0 {
+			continue
+		}
+		res := syncer.Sync()
+		if res.Uploaded > 0 || res.AlreadyPresent > 0 {
+			fmt.Fprintf(stdout, "  synced  %d uploaded, %d already on the master, %d failed\n",
+				res.Uploaded, res.AlreadyPresent, res.Failed)
+		}
+		if res.Failed > 0 {
+			fmt.Fprintf(stderr, "  %d file(s) could not be pushed; they will be retried\n", res.Failed)
+		}
+		syncer.NextInterval(res.OK())
+	}
 }
 
 func cmdDupes(dbPath string, stdout, stderr io.Writer) int {

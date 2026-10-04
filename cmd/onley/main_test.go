@@ -2158,3 +2158,207 @@ func TestReplicaCheck_QueryFailureSkipsTheWholeGroup(t *testing.T) {
 		t.Errorf("the skipped count should be the group size: %s", stdout.String())
 	}
 }
+
+// --- watch sync ---
+
+// waitFor polls until cond holds or the deadline passes. Filesystem events and
+// the sync interval are both time-based, so a fixed sleep would be flaky.
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", what)
+}
+
+// syncBuffer collects a subprocess's output while the test reads it. exec
+// writes from its own goroutine, so a plain bytes.Buffer would be a data race
+// the moment a test polls the output.
+type syncBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (s *syncBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.Write(p)
+}
+
+func (s *syncBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.String()
+}
+
+// startWatch runs the binary in watch mode and returns the process and its
+// combined output.
+func startWatch(t *testing.T, args ...string) (*exec.Cmd, *syncBuffer) {
+	t.Helper()
+	if _, err := exec.LookPath(binaryPath); err != nil {
+		t.Skipf("binary not built: %v", err)
+	}
+	cmd := exec.Command(binaryPath, args...)
+	out := &syncBuffer{}
+	cmd.Stdout = out
+	cmd.Stderr = out
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start watch: %v", err)
+	}
+	t.Cleanup(func() {
+		cmd.Process.Signal(os.Interrupt)
+		cmd.Wait()
+	})
+	return cmd, out
+}
+
+// TestWatchSync_UploadsWithoutDeletingTheLocalFile is the end-to-end version of
+// the property the syncer promises: a file saved into a watched directory gets
+// pushed to the master and stays on disk.
+func TestWatchSync_UploadsWithoutDeletingTheLocalFile(t *testing.T) {
+	masterURL, masterDB := newMasterServer(t)
+	dir := t.TempDir()
+	dbFile := filepath.Join(t.TempDir(), "watch.db")
+	_, out := startWatch(t, "-db", dbFile, "watch", dir, "-master", masterURL, "-interval", "150ms")
+
+	saved := filepath.Join(dir, "photo.jpg")
+	if err := os.WriteFile(saved, []byte("my holiday photo"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sum := md5OfFile(t, saved)
+
+	waitFor(t, "the file to reach the master", func() bool {
+		files, err := masterDB.FindByMD5(sum)
+		return err == nil && len(files) == 1
+	})
+
+	// The file the user saved must still be there. This is the whole point: the
+	// migrate path in `replica check` would have removed it.
+	if _, err := os.Stat(saved); err != nil {
+		t.Fatalf("watch sync removed the local file: %v\nwatch said:\n%s", err, out.String())
+	}
+	if got, err := os.ReadFile(saved); err != nil || string(got) != "my holiday photo" {
+		t.Errorf("the local file was altered: %q err=%v", got, err)
+	}
+	// And it is still indexed, so dupes and clean still see it.
+	local, err := db.Open(dbFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer local.Close()
+	if rec, err := local.Lookup(saved); err != nil || rec == nil {
+		t.Errorf("the local record was dropped: rec=%v err=%v", rec, err)
+	}
+}
+
+// TestWatchSync_ReportsItsMaster: which master is used and that nothing is
+// deleted is stated up front, because a watcher deleting files is the outcome
+// that needs to be visible before it happens.
+func TestWatchSync_ReportsItsMaster(t *testing.T) {
+	masterURL, _ := newMasterServer(t)
+	dir := t.TempDir()
+	dbFile := filepath.Join(t.TempDir(), "watch.db")
+	_, out := startWatch(t, "-db", dbFile, "watch", dir, "-master", masterURL, "-interval", "150ms")
+
+	waitFor(t, "watch to report its master", func() bool {
+		return strings.Contains(out.String(), "from flag")
+	})
+	text := out.String()
+	if !strings.Contains(text, "Nothing is deleted from this machine") {
+		t.Errorf("watch should say that it deletes nothing:\n%s", text)
+	}
+}
+
+// TestWatch_NoMasterIsIndexOnly: without a master this is what watch always was.
+func TestWatch_NoMasterIsIndexOnly(t *testing.T) {
+	fakeHome(t)
+	dir := t.TempDir()
+	dbFile := filepath.Join(t.TempDir(), "watch.db")
+	_, out := startWatch(t, "-db", dbFile, "watch", dir)
+
+	saved := filepath.Join(dir, "f.txt")
+	if err := os.WriteFile(saved, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the file to be indexed", func() bool {
+		return strings.Contains(out.String(), "indexed")
+	})
+	if !strings.Contains(out.String(), "indexing only") {
+		t.Errorf("watch should say it is only indexing:\n%s", out.String())
+	}
+}
+
+// TestWatchSync_KeepsIndexingWhileTheMasterIsDown: an unreachable master slows
+// the uploads down, it does not stop the index.
+func TestWatchSync_KeepsIndexingWhileTheMasterIsDown(t *testing.T) {
+	dir := t.TempDir()
+	dbFile := filepath.Join(t.TempDir(), "watch.db")
+	_, out := startWatch(t, "-db", dbFile, "watch", dir, "-master", "http://127.0.0.1:1", "-interval", "150ms")
+
+	for i := 0; i < 2; i++ {
+		if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("f%d.txt", i)), []byte("content"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	waitFor(t, "both files to be indexed despite the dead master", func() bool {
+		return strings.Count(out.String(), "indexed") >= 2
+	})
+	// And the files are still on disk.
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 2 {
+		t.Errorf("got %d file(s) left in the watched directory, want 2", len(entries))
+	}
+}
+
+// TestWatchSync_IndexingIsNotBlockedBySlowUploads is why the uploads run on
+// their own goroutine.
+//
+// The watcher's event channel has a bounded buffer and drops events when it
+// fills, so an upload running in the indexing loop does not merely slow the
+// index down — it costs entries silently. A master that stalls must not stop
+// files from being indexed.
+func TestWatchSync_IndexingIsNotBlockedBySlowUploads(t *testing.T) {
+	// A master whose ingest takes a while.
+	store, err := db.Open(":memory:")
+	if err != nil {
+		t.Fatalf("master db.Open: %v", err)
+	}
+	t.Cleanup(func() { store.Close() })
+	inner := replica.NewServer(store, t.TempDir()).Handler()
+	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/ingest" {
+			time.Sleep(700 * time.Millisecond)
+		}
+		inner.ServeHTTP(w, r)
+	}))
+	defer slow.Close()
+
+	dir := t.TempDir()
+	dbFile := filepath.Join(t.TempDir(), "watch.db")
+	_, out := startWatch(t, "-db", dbFile, "watch", dir, "-master", slow.URL, "-interval", "100ms")
+
+	for i := 0; i < 3; i++ {
+		if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("f%d.txt", i)), []byte(fmt.Sprintf("content %d", i)), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Three uploads at 700ms each would be over two seconds if the index had to
+	// wait for them. Give it a window comfortably under that.
+	deadline := time.Now().Add(1200 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if strings.Count(out.String(), "indexed") >= 3 {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("indexing waited on the uploads: %d of 3 indexed in 1.2s\nwatch said:\n%s",
+		strings.Count(out.String(), "indexed"), out.String())
+}
